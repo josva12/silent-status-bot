@@ -1,3 +1,53 @@
+<div align="center">
+
+### ⚡ SYSTEM TERMINAL & LIVE LOGS ⚡
+
+<table>
+<tr>
+<td bgcolor="#050801" width="100%">
+
+<pre>
+<font color="#00FF66"><b>
+   ██████╗ ██╗██╗     ███████╗███╗   ██╗████████╗    ██████╗ ██████╗ ████████╗
+   ██╔════╝██║██║     ██╔════╝████╗  ██║╚══██╔══╝    ██╔══██╗██╔══██╗╚══██╔══╝
+   ███████╗██║██║     █████╗  ██╔██╗ ██║   ██║       ██████╔╝██║  ██║   ██║   
+   ╚════██║██║██║     ██╔══╝  ██║╚██╗██║   ██║       ██╔══██╗██║  ██║   ██║   
+   ███████║██║███████╗███████╗██║ ╚████║   ██║       ██████╔╝██████╔╝   ██║   
+   ╚══════╝╚═╝╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝       ╚═════╝ ╚═════╝    ╚═╝   
+</b></font>
+<font color="#00FF66">===================================================================================</font>
+<font color="#00FF66"><b>[SYSTEM STATUS]</b></font> <font color="#00FF00">● ONLINE</font>  |  <font color="#00FF66"><b>[PROCESS]</b></font> <font color="#00FF00">PID 8042 (pm2: silent-status)</font>
+<font color="#00FF66"><b>[CORE MEMORY]</b></font>   <font color="#00FF00">28.4 MB / 1024 MB</font>  |  <font color="#00FF66"><b>[ARCH]</b></font> <font color="#00FF00">Ubuntu 22.04 LTS (x86_64)</font>
+<font color="#00FF66"><b>[AUTHOR/SUDO]</b></font>   <font color="#00FF00">root@josva-vps:~#</font>
+<font color="#00FF66">===================================================================================</font>
+
+<font color="#008000">14:02:01 [SYS_INIT] Loading Baileys WebSocket protocol engine...</font>
+<font color="#00FF00">14:02:03 [NET_CONN] Authentic connection established with WhatsApp Servers [OK]</font>
+<font color="#00FF00">14:02:03 [SUDO_DM]  Startup payload dispatched to owner terminal.</font>
+
+<font color="#00FF66"><b>root@josva-vps:~#</b></font> <font color="#00FF00">tail -f /var/log/silent-status.log</font>
+
+<font color="#33FF33">14:05:12 [STATUS_SWEEP] Intercepted 14 contact status updates.</font>
+<font color="#33FF33">14:05:12 [QUEUE_PROC]  Executing non-blocking receipt pipeline (50ms offset)...</font>
+<font color="#00FF00">14:05:13 [SUCCESS]     100% status views acknowledged silently [NO_MEDIA_DOWNLOADED].</font>
+
+<font color="#FF3333">14:12:44 [EVENT_REVOKE] Deleted message detected in group [40912-US].</font>
+<font color="#00FF66">14:12:44 [ANTI_DELETE] Buffer restored: [TEXT/IMAGE] -> Rerouting payload to SUDO DM.</font>
+<font color="#00FF00">14:12:45 [SUCCESS]     Target media extracted & pushed successfully.</font>
+
+<font color="#00FF66"><b>root@josva-vps:~#</b></font> <font color="#00FF00">_</font>
+</pre>
+
+</td>
+</tr>
+</table>
+
+</div>
+
+
+
+
+
 # Silent Status & Anti-Delete WhatsApp Bot
 
 A lightweight, high-performance WhatsApp utility bot **designed by Josva**.
