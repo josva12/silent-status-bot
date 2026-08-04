@@ -52,20 +52,21 @@
 
 A lightweight, high-performance WhatsApp utility bot **designed by Josva**.
 
-This bot is specifically optimized for VPS deployment (under 30 MB RAM footprint). It automatically views WhatsApp statuses silently without spamming your private chat with downloaded media, restores deleted messages, unlocks View-Once media, and provides in-chat command management.
+This bot is specifically optimized for VPS deployment (under 30 MB RAM footprint). It automatically views WhatsApp statuses silently without spamming your private chat with downloaded media, restores deleted messages, unlocks View-Once media, and provides in-chat command management and dual linking options (QR Code or Pairing Code).
 
 ---
 
 ## Key Features
 
+* **📱 Flexible Device Linking:** Choose between **[1] Terminal QR Code** scan or **[2] 8-digit Pairing Code** linking on first launch.
 * **👀 Silent Auto Status Viewer (`no-dl`):** Automatically sends view receipts for 100% of contact statuses without forwarding media or photos to your chat.
 * **⚡ Non-Blocking Status Queue:** Includes a 50ms queue handler and 5-minute background sweeper so multi-slide status bursts are never skipped.
 * **🗑️ Anti-Delete (`.delete p` / `.delete g`):** Captures deleted text, images, videos, stickers, and voice notes. Forwards deleted media privately to your SUDO DM or back to the same group.
 * **🔓 View-Once Unlocker (`.vv`):** Reply `.vv` to any View-Once photo, video, or voice message to unlock and resend it silently in chat.
 * **💾 Content Saver (`.save`):** Reply `.save` to any text or media to save a copy directly to your private SUDO DM.
 * **⚙️ Dynamic In-Chat Commands:** Control and toggle all bot settings via WhatsApp chat without logging into your VPS.
-* **🚀 VPS Optimized:** Uses under 30 MB RAM, runs cleanly on 1 GB RAM VPS servers.
-* **🔔 Startup Notification:** Sends an automated notification to your WhatsApp DM upon launch, detailing active settings and available commands.
+* **🚀 VPS & Low-RAM Optimized:** Uses under 30 MB RAM, runs cleanly on 1 GB RAM VPS servers.
+* **🔔 Automated Startup Notification:** Sends an automated notification to your WhatsApp DM upon launch, detailing active settings and available commands.
 
 ---
 
@@ -73,6 +74,7 @@ This bot is specifically optimized for VPS deployment (under 30 MB RAM footprint
 
 | Command | Usage | Description |
 | :--- | :--- | :--- |
+| **`.alive`** | `.alive` / `.ping` | Checks bot online status and uptime. |
 | **`.status`** | `.status no-dl` / `.status off` | Toggles status auto-viewing mode. |
 | **`.delete`** | `.delete p` / `.delete g` / `.delete off` | Toggles Anti-Delete mode (Private DM, Group, or Off). |
 | **`.viewall`** | `.viewall` | Manually sweeps and re-views all active 24h status updates. |
@@ -82,21 +84,16 @@ This bot is specifically optimized for VPS deployment (under 30 MB RAM footprint
 
 ---
 
-## VPS Deployment Guide (Step-by-Step)
+## Deployment Options & 24/7 Setup
 
-### Prerequisites
+### Option A: VPS Deployment (Recommended for 24/7 Uptime)
 
-* VPS running **Ubuntu 20.04 / 22.04 / 24.04 LTS**
-* SSH terminal access
-* Node.js v18+ and NPM installed
-
----
+Deploying on a Cloud VPS ($4–$5/mo on Azure, DigitalOcean, AWS, Linode) ensures the bot stays online 24/7/365 regardless of your personal computer's state.
 
 ### Step 1: Install Node.js & PM2 on VPS
-
 ```bash
 sudo apt update && sudo apt upgrade -y
-curl -fsSL [https://deb.nodesource.com/setup_20.x](https://deb.nodesource.com/setup_20.x) | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
 sudo npm install -g pm2
 ```
@@ -104,7 +101,7 @@ sudo npm install -g pm2
 ### Step 2: Clone Repository & Install Dependencies
 
 ```bash
-git clone [https://github.com/josva12/silent-status-bot.git](https://github.com/josva12/silent-status-bot.git)
+git clone https://github.com/josva12/silent-status-bot.git && rm -f silent-status-bot/README.md
 cd silent-status-bot
 npm install
 ```
@@ -116,13 +113,15 @@ Run the bot once in interactive mode to scan the QR code:
 npm start
 ```
 
-1. Open WhatsApp on your phone.
+1. Select [1] for QR Code or [2] for 8-digit Pairing Code.
 
-2. Tap Settings → Linked Devices → Link a Device.
+2. Enter your phone number with country code when prompted (e.g. 254712345678).
 
-3. Scan the QR code displayed in your VPS terminal.
+3. Tap Settings → Linked Devices → Link a Device.
 
-4. Once you see ✅ Connected! Silent Status Bot Active!, press Ctrl + C to stop the interactive session.
+4. Scan the QR code displayed in your VPS terminal if you selected QR Code
+
+5. Once you see ✅ Connected! Silent Status Bot Active!, press Ctrl + C to stop the interactive session.
 
 ### Step 4: Run 24/7 with PM2
 
@@ -133,6 +132,23 @@ pm2 start index.js --name silent-status
 pm2 save
 pm2 startup
 ```
+
+### Option B: Running on a Local Laptop/PC (Preventing Sleep)
+
+If you are running the bot locally on a laptop instead of a VPS, keep in mind that when your laptop enters **Sleep** or **Hibernation**, the operating system powers off network interfaces, which will stop the bot.
+
+To keep the bot running continuously—even with your laptop lid closed—follow the setup for your OS:
+
+* **Windows:**
+  Open **Control Panel** → **Power Options** → **Choose what closing the lid does** → Set to **"Do nothing"** when plugged in.
+
+* **macOS:**
+  Open **System Settings** → **Displays** → **Advanced** → Enable **"Prevent automatic sleeping on power adapter when the display is off"** *(or launch your process using `caffeinate pm2 start index.js` via Terminal)*.
+
+* **Linux:**
+  Edit `/etc/systemd/logind.conf` and set:
+  ```ini
+  HandleLidSwitch=ignore
 
 ### Step 5: Useful Management Commands
 
