@@ -1,6 +1,6 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
 const pino = require('pino');
+const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
@@ -19,8 +19,14 @@ console.error = function (...args) {
     originalConsoleError.apply(console, args);
 };
 
+// Readline interface for interactive CLI prompts
+const rl = readline.createInterface({
+    input: process.stdin, output: process.stdout
+});
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
 // =========================================================
-// PERSISTENT CONFIGURATION
+// PERSISTENT CONFIGURATION (Saved in config.json)
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 
@@ -48,7 +54,6 @@ const recentStatusStore = new Map();
 const startTime = Date.now();
 let hasNotifiedStartup = false;
 
-// Track status keys for .viewall and background sweeper
 function trackStatusKey(key) {
     if (!key || !key.id) return;
     recentStatusStore.set(key.id, key);
@@ -98,21 +103,60 @@ async function sweepAndReadStatuses(sock) {
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    let usePairingCode = false;
+    let userPhoneNumber = '';
+
+    // Handle First-Time Linking Choice
+    if (!state.creds.registered) {
+        console.log(`\n============================================`);
+        console.log(`📱 CHOOSE WHATSAPP LINKING METHOD:`);
+        console.log(`1) Scan QR Code (Terminal QR)`);
+        console.log(`2) Use WhatsApp Pairing Code (8-digit code)`);
+        console.log(`============================================\n`);
+
+        const choice = await question('Select [1] for QR Code or [2] for Pairing Code:\n> ');
+
+        if (choice.trim() === '2') {
+            usePairingCode = true;
+            const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712744075):\n> ');
+            userPhoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+        } else {
+            console.log('\n⌛ Generating QR Code in terminal... Please wait.');
+        }
+    }
+
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true,
+        printQRInTerminal: !usePairingCode, // Enable QR only if choice is 1
         generateHighQualityLinkPreview: false,
         shouldSyncHistoryMessage: () => false
     });
 
+    // Request Pairing Code if Option 2 selected
+    if (usePairingCode && !sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                const code = await sock.requestPairingCode(userPhoneNumber);
+                const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+                console.log(`\n============================================`);
+                console.log(`🔑 YOUR WHATSAPP PAIRING CODE:`);
+                console.log(`\n       👉   ${formattedCode}   👈\n`);
+                console.log(`1. Open WhatsApp on your phone.`);
+                console.log(`2. Tap Settings -> Linked Devices -> Link a Device.`);
+                console.log(`3. Tap 'Link with phone number instead' & enter the code above.`);
+                console.log(`============================================\n`);
+            } catch (err) {
+                console.error('Failed to request pairing code:', err);
+            }
+        }, 3000);
+    }
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-            qrcode.generate(qr, { small: true });
-        }
+        const { connection, lastDisconnect } = update;
+
         if (connection === 'close') {
             hasNotifiedStartup = false;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
@@ -177,7 +221,7 @@ async function startBot() {
                 continue;
             }
 
-            // Cache incoming chat messages for Anti-Delete (Max 300 entries)
+            // Cache incoming chat messages for Anti-Delete
             if (msg.key.id && fromJid !== 'status@broadcast') {
                 messageStore.set(msg.key.id, {
                     key: msg.key,
