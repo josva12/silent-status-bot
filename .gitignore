@@ -3,3 +3,4 @@ auth_info/
 vps_status_cache/
 .env
 *.log
+config.json
