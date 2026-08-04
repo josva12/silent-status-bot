@@ -1,4 +1,5 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType } = require('@whiskeysockets/baileys');
+const qrcodeTerminal = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
@@ -19,9 +20,10 @@ console.error = function (...args) {
     originalConsoleError.apply(console, args);
 };
 
-// Readline interface for interactive CLI prompts
+// Readline interface for CLI choice
 const rl = readline.createInterface({
-    input: process.stdin, output: process.stdout
+    input: process.stdin,
+    output: process.stdout
 });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
@@ -106,7 +108,7 @@ async function startBot() {
     let usePairingCode = false;
     let userPhoneNumber = '';
 
-    // Handle First-Time Linking Choice
+    // First-Time Linking Choice
     if (!state.creds.registered) {
         console.log(`\n============================================`);
         console.log(`📱 CHOOSE WHATSAPP LINKING METHOD:`);
@@ -121,14 +123,13 @@ async function startBot() {
             const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712744075):\n> ');
             userPhoneNumber = phoneNumber.replace(/[^0-9]/g, '');
         } else {
-            console.log('\n⌛ Generating QR Code in terminal... Please wait.');
+            console.log('\n⌛ Waiting for QR Code generation...');
         }
     }
 
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: !usePairingCode, // Enable QR only if choice is 1
         generateHighQualityLinkPreview: false,
         shouldSyncHistoryMessage: () => false
     });
@@ -155,7 +156,12 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+
+        // Render QR in terminal cleanly if option 1 was chosen
+        if (qr && !usePairingCode) {
+            qrcodeTerminal.generate(qr, { small: true });
+        }
 
         if (connection === 'close') {
             hasNotifiedStartup = false;
@@ -164,7 +170,7 @@ async function startBot() {
         } else if (connection === 'open') {
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
-            // Send Startup Notification to SUDO DM
+            // Startup notification
             if (!hasNotifiedStartup) {
                 hasNotifiedStartup = true;
                 setTimeout(async () => {
@@ -177,12 +183,13 @@ async function startBot() {
                                                `• Status View: *${config.AUTO_STATUS_VIEW}*\n` +
                                                `• Anti-Delete: *${config.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
+                                               `• *.alive* - Check bot uptime status\n` +
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
                                                `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
-                                               `• *.viewall* - Manually sweep & re-view all status updates\n` +
+                                               `• *.viewall* - Manually sweep & re-view status updates\n` +
                                                `• *.vv* - Reply to View-Once media to unlock silently\n` +
                                                `• *.save* - Reply to any message/media to save to DM\n` +
-                                               `• *.settings* - View live bot dashboard & RAM usage`;
+                                               `• *.settings* - View live dashboard & RAM usage`;
 
                             await sock.sendMessage(sudoJid, { text: notifyText });
                         }
@@ -278,6 +285,18 @@ async function startBot() {
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
+            // COMMAND: .alive / .ping (Available for user & owner)
+            if (['.alive', '.ping'].includes(command)) {
+                const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
+                const hours = Math.floor(uptimeSec / 3600);
+                const minutes = Math.floor((uptimeSec % 3600) / 60);
+                const seconds = uptimeSec % 60;
+
+                const aliveMsg = `I'm here and ready! 🚀\nUptime : ${hours} hours ${minutes} minutes ${seconds} seconds`;
+                await sock.sendMessage(fromJid, { text: aliveMsg }, { quoted: msg });
+                continue;
+            }
+
             // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
                 if (command === '.viewall' || command === '.readstatus') {
@@ -332,7 +351,7 @@ async function startBot() {
                                      `🗑️ *ANTI DELETE MSG:* ${config.ANTI_DELETE !== 'off' ? '✅ (' + config.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
-                                     `*Commands:* .viewall, .status, .delete, .vv, .save`.trim();
+                                     `*Commands:* .alive, .viewall, .status, .delete, .vv, .save`.trim();
 
                     await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
                     continue;
