@@ -50,17 +50,17 @@ curl -fsSL [https://deb.nodesource.com/setup_20.x](https://deb.nodesource.com/se
 sudo apt install -y nodejs
 sudo npm install -g pm2
 
-### Step 2: Clone Repository & Install Dependencies
+## Step 2: Clone Repository & Install Dependencies
 
 ```bash
 git clone [https://github.com/josva12/silent-status-bot.git](https://github.com/josva12/silent-status-bot.git)
 cd silent-status-bot
 npm install
 
-### Step 3: Link WhatsApp Account (QR Code Scan)
+Step 3: Link WhatsApp Account (QR Code Scan)
 Run the bot once in interactive mode to scan the QR code:
 
-```
+```bash
 npm start
 
 Open WhatsApp on your phone.
@@ -71,7 +71,8 @@ Scan the QR code displayed in your VPS terminal.
 
 Once you see ✅ Connected! Silent Status Bot Active!, press Ctrl + C to stop the interactive session.
 
-### Step 4: Run 24/7 with PM2
+## Step 4: Run 24/7 with PM2
+
 Start the bot as a background service:
 
 ```bash
