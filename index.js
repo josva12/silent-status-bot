@@ -120,7 +120,7 @@ async function startBot() {
 
         if (choice.trim() === '2') {
             usePairingCode = true;
-            const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712744075):\n> ');
+            const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712345678):\n> ');
             userPhoneNumber = phoneNumber.replace(/[^0-9]/g, '');
         } else {
             console.log('\n⌛ Waiting for QR Code generation...');
@@ -158,7 +158,6 @@ async function startBot() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Render QR in terminal cleanly if option 1 was chosen
         if (qr && !usePairingCode) {
             qrcodeTerminal.generate(qr, { small: true });
         }
@@ -285,7 +284,7 @@ async function startBot() {
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
-            // COMMAND: .alive / .ping (Available for user & owner)
+            // COMMAND: .alive / .ping
             if (['.alive', '.ping'].includes(command)) {
                 const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                 const hours = Math.floor(uptimeSec / 3600);
