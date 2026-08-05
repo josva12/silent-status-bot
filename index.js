@@ -134,12 +134,16 @@ async function sweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
+    const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
+    const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    
     let usePairingCode = false;
     let userPhoneNumber = '';
     const isInteractive = process.stdin.isTTY;
 
-    if (!state.creds.registered) {
+    // First-Time Linking Choice (Only prompt if creds.json does NOT exist on disk)
+    if (!isRegisteredOnDisk && !state.creds.registered) {
         if (isInteractive) {
             console.log(`\n============================================`);
             console.log(`📱 CHOOSE WHATSAPP LINKING METHOD:`);
@@ -157,7 +161,7 @@ async function startBot() {
                 console.log('\n⌛ Waiting for QR Code generation...');
             }
         } else {
-            console.log('\n⚠️ Account not registered yet! Run "npm start" in terminal once to link your account.');
+            console.log('\n⚠️ No session credentials found in auth_info! Run "npm start" in terminal once to link your account.');
         }
     }
 
@@ -168,6 +172,7 @@ async function startBot() {
         shouldSyncHistoryMessage: () => false
     });
 
+    // Request Pairing Code if Option 2 selected
     if (usePairingCode && !sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -202,6 +207,7 @@ async function startBot() {
         } else if (connection === 'open') {
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
+            // Startup notification
             if (!hasNotifiedStartup) {
                 hasNotifiedStartup = true;
                 setTimeout(async () => {
@@ -231,6 +237,7 @@ async function startBot() {
         }
     });
 
+    // 5-Minute Auto-Sweeper Timer
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
