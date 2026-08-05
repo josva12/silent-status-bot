@@ -139,7 +139,6 @@ async function startBot() {
     let userPhoneNumber = '';
     const isInteractive = process.stdin.isTTY;
 
-    // First-Time Linking Choice (Only prompt if running interactively in terminal)
     if (!state.creds.registered) {
         if (isInteractive) {
             console.log(`\n============================================`);
@@ -169,7 +168,6 @@ async function startBot() {
         shouldSyncHistoryMessage: () => false
     });
 
-    // Request Pairing Code if Option 2 selected
     if (usePairingCode && !sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -204,7 +202,6 @@ async function startBot() {
         } else if (connection === 'open') {
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
-            // Startup notification
             if (!hasNotifiedStartup) {
                 hasNotifiedStartup = true;
                 setTimeout(async () => {
@@ -218,6 +215,7 @@ async function startBot() {
                                                `• Anti-Delete: *${config.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
                                                `• *.alive* - Check bot uptime status\n` +
+                                               `• *.sticker* | *.s* - Reply to photo/video to make sticker\n` +
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
                                                `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
                                                `• *.viewall* - Manually sweep & re-view status updates\n` +
@@ -233,7 +231,6 @@ async function startBot() {
         }
     });
 
-    // 5-Minute Auto-Sweeper Timer (Silent)
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
@@ -331,6 +328,40 @@ async function startBot() {
                 continue;
             }
 
+            // COMMAND: .sticker / .s (Photo/Video to Sticker Maker)
+            if (['.sticker', '.s', '.stk'].includes(command)) {
+                const targetMedia = quotedMsg || msg.message;
+                const mediaType = quotedMsg ? getContentType(quotedMsg) : type;
+
+                if (['imageMessage', 'videoMessage'].includes(mediaType)) {
+                    try {
+                        const targetMsgObj = quotedMsg ? {
+                            key: { remoteJid: fromJid, id: msg.message.extendedTextMessage.contextInfo.stanzaId },
+                            message: quotedMsg
+                        } : msg;
+
+                        const mediaBuffer = await downloadMediaMessage(targetMsgObj, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+
+                        if (mediaBuffer) {
+                            const { Sticker, StickerTypes } = require('wa-sticker-formatter');
+                            const sticker = new Sticker(mediaBuffer, {
+                                pack: 'Silent Status Bot',
+                                author: 'Josva',
+                                type: StickerTypes.FULL,
+                                quality: 70
+                            });
+
+                            const stickerBuffer = await sticker.toBuffer();
+                            await sock.sendMessage(fromJid, { sticker: stickerBuffer }, { quoted: msg });
+                            console.log(`[.sticker COMMAND] Sticker created successfully`);
+                        }
+                    } catch (err) {
+                        console.error('.sticker command error:', err);
+                    }
+                }
+                continue;
+            }
+
             // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
                 if (command === '.viewall' || command === '.readstatus') {
@@ -385,7 +416,7 @@ async function startBot() {
                                      `🗑️ *ANTI DELETE MSG:* ${config.ANTI_DELETE !== 'off' ? '✅ (' + config.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
-                                     `*Commands:* .alive, .viewall, .status, .delete, .vv, .save`.trim();
+                                     `*Commands:* .alive, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
 
                     await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
                     continue;
