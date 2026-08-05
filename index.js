@@ -5,22 +5,42 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// Suppress harmless libsignal session noise from logs
-const originalConsoleError = console.error;
-console.error = function (...args) {
-    const errorStr = args.join(' ');
-    if (
-        errorStr.includes('MessageCounterError') ||
-        errorStr.includes('Failed to decrypt') ||
-        errorStr.includes('SessionEntry') ||
-        errorStr.includes('Closing session')
-    ) {
-        return;
-    }
-    originalConsoleError.apply(console, args);
+// Universal Noise Filter for PM2 Logs
+const isNoise = (args) => {
+    const str = args.map(a => {
+        if (typeof a === 'object') {
+            try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }
+        return String(a);
+    }).join(' ');
+
+    return (
+        str.includes('MessageCounterError') ||
+        str.includes('Failed to decrypt') ||
+        str.includes('SessionEntry') ||
+        errorIsSessionObject(args) ||
+        str.includes('Closing session') ||
+        str.includes('Closing open session') ||
+        str.includes('Bad MAC') ||
+        str.includes('Session error') ||
+        str.includes('registrationId') ||
+        str.includes('_chains') ||
+        str.includes('currentRatchet')
+    );
 };
 
-// Readline interface for CLI choice
+function errorIsSessionObject(args) {
+    return args.some(arg => arg && typeof arg === 'object' && (arg.registrationId || arg.currentRatchet || arg._chains));
+}
+
+['log', 'error', 'info', 'warn'].forEach((method) => {
+    const orig = console[method];
+    console[method] = function (...args) {
+        if (isNoise(args)) return;
+        orig.apply(console, args);
+    };
+});
+
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
@@ -53,6 +73,7 @@ function saveConfig() {
 
 const messageStore = new Map();
 const recentStatusStore = new Map();
+const viewedStatusIds = new Set();
 const startTime = Date.now();
 let hasNotifiedStartup = false;
 
@@ -67,7 +88,7 @@ function trackStatusKey(key) {
 }
 
 // =========================================================
-// STATUS QUEUE (50ms Micro-Delay)
+// STATUS QUEUE (Deduplicated & Non-Blocking)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -82,7 +103,16 @@ async function processStatusQueue(sock) {
 
         try {
             await sock.readMessages([item.key]);
-            console.log(`[STATUS VIEWED] ID: ${item.key.id} From: ${item.key.participant}`);
+
+            if (!viewedStatusIds.has(item.key.id)) {
+                viewedStatusIds.add(item.key.id);
+                console.log(`[STATUS VIEWED] ID: ${item.key.id} From: ${item.key.participant}`);
+
+                if (viewedStatusIds.size > 2000) {
+                    const first = viewedStatusIds.values().next().value;
+                    viewedStatusIds.delete(first);
+                }
+            }
         } catch (err) {}
 
         await new Promise(res => setTimeout(res, 50));
@@ -107,23 +137,28 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     let usePairingCode = false;
     let userPhoneNumber = '';
+    const isInteractive = process.stdin.isTTY;
 
-    // First-Time Linking Choice
+    // First-Time Linking Choice (Only prompt if running interactively in terminal)
     if (!state.creds.registered) {
-        console.log(`\n============================================`);
-        console.log(`📱 CHOOSE WHATSAPP LINKING METHOD:`);
-        console.log(`1) Scan QR Code (Terminal QR)`);
-        console.log(`2) Use WhatsApp Pairing Code (8-digit code)`);
-        console.log(`============================================\n`);
+        if (isInteractive) {
+            console.log(`\n============================================`);
+            console.log(`📱 CHOOSE WHATSAPP LINKING METHOD:`);
+            console.log(`1) Scan QR Code (Terminal QR)`);
+            console.log(`2) Use WhatsApp Pairing Code (8-digit code)`);
+            console.log(`============================================\n`);
 
-        const choice = await question('Select [1] for QR Code or [2] for Pairing Code:\n> ');
+            const choice = await question('Select [1] for QR Code or [2] for Pairing Code:\n> ');
 
-        if (choice.trim() === '2') {
-            usePairingCode = true;
-            const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712345678):\n> ');
-            userPhoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+            if (choice.trim() === '2') {
+                usePairingCode = true;
+                const phoneNumber = await question('\n📱 Enter your WhatsApp phone number with country code (e.g. 254712345678):\n> ');
+                userPhoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+            } else {
+                console.log('\n⌛ Waiting for QR Code generation...');
+            }
         } else {
-            console.log('\n⌛ Waiting for QR Code generation...');
+            console.log('\n⚠️ Account not registered yet! Run "npm start" in terminal once to link your account.');
         }
     }
 
@@ -158,7 +193,7 @@ async function startBot() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        if (qr && !usePairingCode) {
+        if (qr && !usePairingCode && isInteractive) {
             qrcodeTerminal.generate(qr, { small: true });
         }
 
@@ -198,7 +233,7 @@ async function startBot() {
         }
     });
 
-    // 5-Minute Auto-Sweeper Timer
+    // 5-Minute Auto-Sweeper Timer (Silent)
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
