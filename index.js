@@ -112,7 +112,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// INSTANT 20MS STATUS QUEUE (Day 1 High-Speed Sync)
+// STATUS QUEUE (Strict Key Normalization & Auto-Retry)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -126,33 +126,41 @@ async function processStatusQueue(sock) {
         if (!item || !item.msg || !item.msg.key) continue;
 
         const statusId = item.msg.key.id;
-        const participant = item.msg.key.participant || item.msg.key.remoteJid;
+        const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
         if (!item.force && viewedStatusSet.has(statusId)) continue;
 
-        try {
-            // 1. High-level readMessages call
-            await sock.readMessages([item.msg.key]);
+        // Strict key normalization required for phone AppState sync
+        const cleanKey = {
+            remoteJid: 'status@broadcast',
+            id: statusId,
+            participant: participant,
+            fromMe: false
+        };
 
-            // 2. Dual WABinary Receipt Stanzas (Contact View + Phone AppState Sync)
+        try {
+            // 1. High-level readMessages with normalized key
+            await sock.readMessages([cleanKey]);
+
+            // 2. Explicit read receipt stanzas
             if (sock.sendReceipt) {
                 await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
                 await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
             }
 
             markStatusAsViewedOnDisk(statusId);
-            console.log(`[STATUS VIEWED & SYNCED 100%] ID: ${statusId} From: ${participant}`);
+            console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
         } catch (err) {
+            // Re-queue once if socket was temporarily reconnecting
             if (!viewedStatusSet.has(statusId)) {
                 setTimeout(() => {
                     statusQueue.push(item);
                     if (activeSock) processStatusQueue(activeSock);
-                }, 2000);
+                }, 1000);
             }
         }
 
-        // Fast 20ms micro-delay for 100% responsive throughput
-        await new Promise(res => setTimeout(res, 20));
+        await new Promise(res => setTimeout(res, 50));
     }
 
     isProcessingQueue = false;
@@ -220,10 +228,9 @@ async function startBot() {
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 25000,
+        keepAliveIntervalMs: 30000, // 30s Keep-Alive Ping
         connectTimeoutMs: 60000,
-        retryRequestDelayMs: 2000,
-        markOnlineOnConnect: false
+        retryRequestDelayMs: 2000
     });
 
     if (usePairingCode && !sock.authState.creds.registered) {
@@ -312,6 +319,7 @@ async function startBot() {
         }
     });
 
+    // 5-Minute Auto-Sweeper Timer
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
