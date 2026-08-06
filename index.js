@@ -48,9 +48,10 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION (Saved in config.json)
+// PERSISTENT CONFIGURATION & VIEWED STATUS TRACKER
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
+const viewedPath = path.join(__dirname, 'viewed_statuses.json');
 
 let config = {
     AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
@@ -72,11 +73,32 @@ function saveConfig() {
     } catch (e) {}
 }
 
+// Disk-backed memory so bot NEVER forgets viewed statuses across restarts
+let viewedStatusSet = new Set();
+if (fs.existsSync(viewedPath)) {
+    try {
+        const saved = JSON.parse(fs.readFileSync(viewedPath, 'utf-8'));
+        viewedStatusSet = new Set(saved);
+    } catch (e) {}
+}
+
+function markStatusAsViewedOnDisk(id) {
+    if (!id) return;
+    viewedStatusSet.add(id);
+
+    if (viewedStatusSet.size > 3000) {
+        const first = viewedStatusSet.values().next().value;
+        viewedStatusSet.delete(first);
+    }
+
+    try {
+        fs.writeFileSync(viewedPath, JSON.stringify(Array.from(viewedStatusSet)));
+    } catch (e) {}
+}
+
 const messageStore = new Map();
 const recentStatusStore = new Map();
-const viewedStatusIds = new Set();
 const startTime = Date.now();
-
 let activeSock = null;
 
 function trackStatusKey(msg) {
@@ -90,7 +112,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// STATUS QUEUE (With CDN Fetch & Multi-Device Phone Sync)
+// RESILIENT STATUS QUEUE (Auto-Retry on Reconnects)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -103,8 +125,13 @@ async function processStatusQueue(sock) {
         const item = statusQueue.shift();
         if (!item || !item.msg || !item.msg.key) continue;
 
+        const statusId = item.msg.key.id;
+
+        // Skip if already processed and saved to disk
+        if (viewedStatusSet.has(statusId)) continue;
+
         try {
-            // 1. Fetch CDN media stream in memory for CDN playback event
+            // 1. Fetch CDN media stream in memory to trigger CDN playback event
             if (item.msg.message) {
                 await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
             }
@@ -114,19 +141,20 @@ async function processStatusQueue(sock) {
 
             // 3. Multi-device read-self receipt node (Triggers phone UI sync)
             if (sock.sendReceipt) {
-                await sock.sendReceipt('status@broadcast', item.msg.key.participant, [item.msg.key.id], 'read-self');
+                await sock.sendReceipt('status@broadcast', item.msg.key.participant, [statusId], 'read-self');
             }
 
-            if (!viewedStatusIds.has(item.msg.key.id)) {
-                viewedStatusIds.add(item.msg.key.id);
-                console.log(`[STATUS VIEWED & SYNCED] ID: ${item.msg.key.id} From: ${item.msg.key.participant}`);
-
-                if (viewedStatusIds.size > 2000) {
-                    const first = viewedStatusIds.values().next().value;
-                    viewedStatusIds.delete(first);
-                }
+            markStatusAsViewedOnDisk(statusId);
+            console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${item.msg.key.participant}`);
+        } catch (err) {
+            // Auto-retry in 2 seconds if socket was reconnecting
+            if (!viewedStatusSet.has(statusId)) {
+                setTimeout(() => {
+                    statusQueue.push(item);
+                    if (activeSock) processStatusQueue(activeSock);
+                }, 2000);
             }
-        } catch (err) {}
+        }
 
         await new Promise(res => setTimeout(res, 100));
     }
@@ -137,8 +165,10 @@ async function processStatusQueue(sock) {
 async function sweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
-        statusQueue.push({ msg });
-        count++;
+        if (!viewedStatusSet.has(id)) {
+            statusQueue.push({ msg });
+            count++;
+        }
     }
     if (count > 0) {
         processStatusQueue(sock);
@@ -177,7 +207,6 @@ async function startBot() {
         }
     }
 
-    // High-frequency keep-alive ping prevents 428 connection closed drops
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
@@ -219,7 +248,6 @@ async function startBot() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-            // Clean up old socket listeners to prevent stale ratchet desync
             if (activeSock) {
                 try {
                     activeSock.ev.removeAllListeners();
@@ -229,7 +257,7 @@ async function startBot() {
             }
 
             if (!isLoggedOut) {
-                setTimeout(() => startBot(), 3000); // 3s clean reconnect
+                setTimeout(() => startBot(), 2000);
             } else {
                 console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
             }
@@ -237,6 +265,7 @@ async function startBot() {
             activeSock = sock;
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
+            // Immediate catch-up sweep on connection
             sweepAndReadStatuses(sock);
 
             if (!config.NOTIFIED_STARTUP) {
