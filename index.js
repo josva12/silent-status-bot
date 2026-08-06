@@ -54,7 +54,8 @@ const configPath = path.join(__dirname, 'config.json');
 
 let config = {
     AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
-    ANTI_DELETE: 'p'           // 'p', 'g', or 'off'
+    ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
+    NOTIFIED_STARTUP: false    // Sent once on Day 1, saved to disk
 };
 
 if (fs.existsSync(configPath)) {
@@ -75,7 +76,6 @@ const messageStore = new Map();
 const recentStatusStore = new Map();
 const viewedStatusIds = new Set();
 const startTime = Date.now();
-let hasNotifiedStartup = false;
 
 function trackStatusKey(key) {
     if (!key || !key.id) return;
@@ -142,7 +142,6 @@ async function startBot() {
     let userPhoneNumber = '';
     const isInteractive = process.stdin.isTTY;
 
-    // First-Time Linking Choice (Only prompt if creds.json does NOT exist on disk)
     if (!isRegisteredOnDisk && !state.creds.registered) {
         if (isInteractive) {
             console.log(`\n============================================`);
@@ -172,7 +171,6 @@ async function startBot() {
         shouldSyncHistoryMessage: () => false
     });
 
-    // Request Pairing Code if Option 2 selected
     if (usePairingCode && !sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -201,15 +199,29 @@ async function startBot() {
         }
 
         if (connection === 'close') {
-            hasNotifiedStartup = false;
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) startBot();
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
+            if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
+                console.log(`[SOCKET RECONNECT] Refreshing connection (StatusCode: ${statusCode})...`);
+            }
+
+            if (!isLoggedOut) {
+                setTimeout(() => startBot(), 2000);
+            } else {
+                console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
+            }
         } else if (connection === 'open') {
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
-            // Startup notification
-            if (!hasNotifiedStartup) {
-                hasNotifiedStartup = true;
+            // Perform immediate catch-up status sweep upon connection
+            sweepAndReadStatuses(sock);
+
+            // Startup notification (Sent ONLY ONCE on Day 1, saved to config.json)
+            if (!config.NOTIFIED_STARTUP) {
+                config.NOTIFIED_STARTUP = true;
+                saveConfig();
+
                 setTimeout(async () => {
                     try {
                         const sudoJid = sock.user ? (sock.user.id.split(':')[0] + '@s.whatsapp.net') : null;
