@@ -112,7 +112,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// STATUS QUEUE (With Force Resync Capability)
+// INSTANT 20MS STATUS QUEUE (Day 1 High-Speed Sync)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -126,22 +126,22 @@ async function processStatusQueue(sock) {
         if (!item || !item.msg || !item.msg.key) continue;
 
         const statusId = item.msg.key.id;
+        const participant = item.msg.key.participant || item.msg.key.remoteJid;
 
         if (!item.force && viewedStatusSet.has(statusId)) continue;
 
         try {
-            if (item.msg.message) {
-                await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
-            }
-
+            // 1. High-level readMessages call
             await sock.readMessages([item.msg.key]);
 
+            // 2. Dual WABinary Receipt Stanzas (Contact View + Phone AppState Sync)
             if (sock.sendReceipt) {
-                await sock.sendReceipt('status@broadcast', item.msg.key.participant, [statusId], 'read-self');
+                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
+                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
             }
 
             markStatusAsViewedOnDisk(statusId);
-            console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${item.msg.key.participant}`);
+            console.log(`[STATUS VIEWED & SYNCED 100%] ID: ${statusId} From: ${participant}`);
         } catch (err) {
             if (!viewedStatusSet.has(statusId)) {
                 setTimeout(() => {
@@ -151,7 +151,8 @@ async function processStatusQueue(sock) {
             }
         }
 
-        await new Promise(res => setTimeout(res, 100));
+        // Fast 20ms micro-delay for 100% responsive throughput
+        await new Promise(res => setTimeout(res, 20));
     }
 
     isProcessingQueue = false;
@@ -215,12 +216,11 @@ async function startBot() {
         }
     }
 
-    // Optimized WASocket config without shouldSyncHistoryMessage override to prevent 428 drops
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 25000, // 25s keep-alive ping
+        keepAliveIntervalMs: 25000,
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000,
         markOnlineOnConnect: false
@@ -312,7 +312,6 @@ async function startBot() {
         }
     });
 
-    // 5-Minute Auto-Sweeper Timer
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
