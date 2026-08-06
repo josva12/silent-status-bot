@@ -113,7 +113,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (With Batch AppState Commit & Guard)
+// PACED STATUS QUEUE (Rate-limited, with retry on failure)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -122,52 +122,35 @@ async function processStatusQueue(sock) {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
 
-    let processedAny = false;
-    let lastProcessedMsg = null;
-
     try {
         while (statusQueue.length > 0) {
             const item = statusQueue.shift();
             if (!item || !item.msg || !item.msg.key) continue;
 
             const statusId = item.msg.key.id;
-            const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
+            // Always use key.participant — this is the LID/JID of the status poster
+            const participant = item.msg.key.participant || item.msg.key.remoteJid;
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
 
-            // Guard: skip malformed entries with no valid participant
+            // Skip malformed entries with no valid participant
             if (!participant || participant === 'status@broadcast') continue;
 
-            const cleanKey = {
-                remoteJid: 'status@broadcast',
-                id: statusId,
-                participant: participant,
-                fromMe: false
-            };
-
             try {
-                // 1. High-level readMessages call
-                await sock.readMessages([cleanKey]);
+                // Step 1: Force-send 'read' receipt directly (bypasses the privacy setting check
+                // inside readMessages, which would send 'read-self' if receipts are turned off).
+                // WhatsApp server REQUIRES a 'read' type receipt to register the view and push
+                // the status into "Viewed Updates" on the primary phone.
+                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read');
 
-                // 2. Explicit 'read' receipt stanza for contact
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
-                }
-
-                // 3. 300ms spacing before sending multi-device 'read-self' stanza
-                await new Promise(res => setTimeout(res, 300));
-
-                // 4. Explicit 'read-self' receipt stanza for Multi-Device Phone UI Sync
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
-                }
+                // Step 2: Send 'read-self' for multi-device sync (tells your own other devices)
+                await new Promise(res => setTimeout(res, 250));
+                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
 
                 markStatusAsViewedOnDisk(statusId);
-                lastProcessedMsg = item.msg;
-                processedAny = true;
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
             } catch (err) {
-                // Re-queue once for retry after a short delay if not already marked
+                // Re-queue for retry if not already marked as done
                 if (!viewedStatusSet.has(statusId)) {
                     setTimeout(() => {
                         statusQueue.push(item);
@@ -176,17 +159,8 @@ async function processStatusQueue(sock) {
                 }
             }
 
-            // Paced 1200ms delay per status item to avoid rate-limiting
+            // 1200ms pacing between items to avoid WhatsApp rate-limiting
             await new Promise(res => setTimeout(res, 1200));
-        }
-
-        // BATCH COMMIT: Call chatModify ONCE after processing the entire batch.
-        // lastMessages is required — without it Baileys skips the AppState write.
-        if (processedAny && sock.chatModify && lastProcessedMsg) {
-            await sock.chatModify(
-                { markRead: true, lastMessages: [lastProcessedMsg] },
-                'status@broadcast'
-            ).catch(() => null);
         }
     } finally {
         isProcessingQueue = false;
