@@ -123,6 +123,7 @@ async function processStatusQueue(sock) {
     isProcessingQueue = true;
 
     let processedAny = false;
+    let lastProcessedMsg = null;
 
     try {
         while (statusQueue.length > 0) {
@@ -133,6 +134,9 @@ async function processStatusQueue(sock) {
             const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
+
+            // Guard: skip malformed entries with no valid participant
+            if (!participant || participant === 'status@broadcast') continue;
 
             const cleanKey = {
                 remoteJid: 'status@broadcast',
@@ -159,20 +163,28 @@ async function processStatusQueue(sock) {
                 }
 
                 markStatusAsViewedOnDisk(statusId);
+                lastProcessedMsg = item.msg;
                 processedAny = true;
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
             } catch (err) {
-                // Item error handling
+                // Re-queue once for retry after a short delay if not already marked
+                if (!viewedStatusSet.has(statusId)) {
+                    setTimeout(() => {
+                        statusQueue.push(item);
+                        if (activeSock) processStatusQueue(activeSock);
+                    }, 3000);
+                }
             }
 
             // Paced 1200ms delay per status item to avoid rate-limiting
             await new Promise(res => setTimeout(res, 1200));
         }
 
-        // BATCH COMMIT: Call chatModify ONCE after processing the entire batch
-        if (processedAny && sock.chatModify) {
+        // BATCH COMMIT: Call chatModify ONCE after processing the entire batch.
+        // lastMessages is required — without it Baileys skips the AppState write.
+        if (processedAny && sock.chatModify && lastProcessedMsg) {
             await sock.chatModify(
-                { markRead: true },
+                { markRead: true, lastMessages: [lastProcessedMsg] },
                 'status@broadcast'
             ).catch(() => null);
         }
