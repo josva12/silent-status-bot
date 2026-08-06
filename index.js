@@ -164,11 +164,15 @@ async function startBot() {
         }
     }
 
+    // Keep-Alive Configuration to Prevent 428 Connection Closed Errors
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        shouldSyncHistoryMessage: () => false
+        shouldSyncHistoryMessage: () => false,
+        keepAliveIntervalMs: 30000, // 30s Keep-Alive Ping
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0
     });
 
     if (usePairingCode && !sock.authState.creds.registered) {
@@ -203,21 +207,21 @@ async function startBot() {
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
             if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
-                console.log(`[SOCKET RECONNECT] Refreshing connection (StatusCode: ${statusCode})...`);
+                console.log(`[SOCKET RECONNECT] Refreshing session (StatusCode: ${statusCode})...`);
             }
 
             if (!isLoggedOut) {
-                setTimeout(() => startBot(), 2000);
+                setTimeout(() => startBot(), 3000); // 3s smooth buffer
             } else {
                 console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
             }
         } else if (connection === 'open') {
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
-            // Perform immediate catch-up status sweep upon connection
+            // Perform catch-up status sweep upon connection
             sweepAndReadStatuses(sock);
 
-            // Startup notification (Sent ONLY ONCE on Day 1, saved to config.json)
+            // Startup notification
             if (!config.NOTIFIED_STARTUP) {
                 config.NOTIFIED_STARTUP = true;
                 saveConfig();
