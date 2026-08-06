@@ -100,6 +100,7 @@ const recentStatusStore = new Map();
 const startTime = Date.now();
 let activeSock = null;
 let initialActiveLogged = false;
+let sweeperInterval = null;
 
 function trackStatusKey(msg) {
     if (!msg || !msg.key || !msg.key.id) return;
@@ -112,7 +113,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (AppState Patching & Rate Limit Protection)
+// PACED STATUS QUEUE (With Batch AppState Commit & Guard)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -121,68 +122,63 @@ async function processStatusQueue(sock) {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
 
-    while (statusQueue.length > 0) {
-        const item = statusQueue.shift();
-        if (!item || !item.msg || !item.msg.key) continue;
+    let processedAny = false;
 
-        const statusId = item.msg.key.id;
-        const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
+    try {
+        while (statusQueue.length > 0) {
+            const item = statusQueue.shift();
+            if (!item || !item.msg || !item.msg.key) continue;
 
-        if (!item.force && viewedStatusSet.has(statusId)) continue;
+            const statusId = item.msg.key.id;
+            const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
-        const cleanKey = {
-            remoteJid: 'status@broadcast',
-            id: statusId,
-            participant: participant,
-            fromMe: false
-        };
+            if (!item.force && viewedStatusSet.has(statusId)) continue;
 
-        try {
-            // 1. Fetch CDN media stream in memory for CDN playback event
-            if (item.msg.message) {
-                await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+            const cleanKey = {
+                remoteJid: 'status@broadcast',
+                id: statusId,
+                participant: participant,
+                fromMe: false
+            };
+
+            try {
+                // 1. High-level readMessages call
+                await sock.readMessages([cleanKey]);
+
+                // 2. Explicit 'read' receipt stanza for contact
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
+                }
+
+                // 3. 300ms spacing before sending multi-device 'read-self' stanza
+                await new Promise(res => setTimeout(res, 300));
+
+                // 4. Explicit 'read-self' receipt stanza for Multi-Device Phone UI Sync
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+                }
+
+                markStatusAsViewedOnDisk(statusId);
+                processedAny = true;
+                console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
+            } catch (err) {
+                // Item error handling
             }
 
-            // 2. High-level readMessages
-            await sock.readMessages([cleanKey]);
-
-            // 3. Explicit 'read' receipt stanza for contact
-            if (sock.sendReceipt) {
-                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
-            }
-
-            // 4. 300ms spacing before sending multi-device 'read-self' stanza
-            await new Promise(res => setTimeout(res, 300));
-
-            // 5. Explicit 'read-self' receipt stanza for Multi-Device Phone UI Sync
-            if (sock.sendReceipt) {
-                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
-            }
-
-            // 6. AppState Sync Mutation via chatModify
-            if (sock.chatModify) {
-                await sock.chatModify(
-                    { markRead: true, lastMessages: [item.msg] },
-                    'status@broadcast'
-                ).catch(() => null);
-            }
-
-            markStatusAsViewedOnDisk(statusId);
-            console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
-        } catch (err) {
-            if (!viewedStatusSet.has(statusId)) {
-                setTimeout(() => {
-                    statusQueue.push(item);
-                    if (activeSock) processStatusQueue(activeSock);
-                }, 2000);
-            }
+            // Paced 1200ms delay per status item to avoid rate-limiting
+            await new Promise(res => setTimeout(res, 1200));
         }
 
-        // Paced 1200ms delay per status item to avoid WhatsApp AppState rate limits
-        await new Promise(res => setTimeout(res, 1200));
+        // BATCH COMMIT: Call chatModify ONCE after processing the entire batch
+        if (processedAny && sock.chatModify) {
+            await sock.chatModify(
+                { markRead: true },
+                'status@broadcast'
+            ).catch(() => null);
+        }
+    } finally {
+        isProcessingQueue = false;
     }
-
-    isProcessingQueue = false;
 }
 
 async function sweepAndReadStatuses(sock) {
@@ -250,7 +246,6 @@ async function startBot() {
         keepAliveIntervalMs: 30000,
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000,
-        // Message lookup callback required by Baileys for constructing AppState sync packets
         getMessage: async (key) => {
             if (key.id && messageStore.has(key.id)) {
                 return messageStore.get(key.id).message;
@@ -348,10 +343,16 @@ async function startBot() {
         }
     });
 
+    // Clear old timer on reconnect to prevent interval leaks
+    if (sweeperInterval) {
+        clearInterval(sweeperInterval);
+        sweeperInterval = null;
+    }
+
     // 5-Minute Auto-Sweeper Timer
-    setInterval(() => {
-        if (config.AUTO_STATUS_VIEW !== 'off') {
-            sweepAndReadStatuses(sock);
+    sweeperInterval = setInterval(() => {
+        if (config.AUTO_STATUS_VIEW !== 'off' && activeSock) {
+            sweepAndReadStatuses(activeSock);
         }
     }, 5 * 60 * 1000);
 
