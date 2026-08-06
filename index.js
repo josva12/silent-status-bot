@@ -112,7 +112,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// STATUS QUEUE (Strict Key Normalization & Auto-Retry)
+// PACED STATUS QUEUE (AppState Patching & Rate Limit Protection)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -130,7 +130,6 @@ async function processStatusQueue(sock) {
 
         if (!item.force && viewedStatusSet.has(statusId)) continue;
 
-        // Strict key normalization required for phone AppState sync
         const cleanKey = {
             remoteJid: 'status@broadcast',
             id: statusId,
@@ -139,28 +138,48 @@ async function processStatusQueue(sock) {
         };
 
         try {
-            // 1. High-level readMessages with normalized key
+            // 1. Fetch CDN media stream in memory for CDN playback event
+            if (item.msg.message) {
+                await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+            }
+
+            // 2. High-level readMessages
             await sock.readMessages([cleanKey]);
 
-            // 2. Explicit read receipt stanzas
+            // 3. Explicit 'read' receipt stanza for contact
             if (sock.sendReceipt) {
                 await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
+            }
+
+            // 4. 300ms spacing before sending multi-device 'read-self' stanza
+            await new Promise(res => setTimeout(res, 300));
+
+            // 5. Explicit 'read-self' receipt stanza for Multi-Device Phone UI Sync
+            if (sock.sendReceipt) {
                 await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+            }
+
+            // 6. AppState Sync Mutation via chatModify
+            if (sock.chatModify) {
+                await sock.chatModify(
+                    { markRead: true, lastMessages: [item.msg] },
+                    'status@broadcast'
+                ).catch(() => null);
             }
 
             markStatusAsViewedOnDisk(statusId);
             console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
         } catch (err) {
-            // Re-queue once if socket was temporarily reconnecting
             if (!viewedStatusSet.has(statusId)) {
                 setTimeout(() => {
                     statusQueue.push(item);
                     if (activeSock) processStatusQueue(activeSock);
-                }, 1000);
+                }, 2000);
             }
         }
 
-        await new Promise(res => setTimeout(res, 50));
+        // Paced 1200ms delay per status item to avoid WhatsApp AppState rate limits
+        await new Promise(res => setTimeout(res, 1200));
     }
 
     isProcessingQueue = false;
@@ -228,9 +247,19 @@ async function startBot() {
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 30000, // 30s Keep-Alive Ping
+        keepAliveIntervalMs: 30000,
         connectTimeoutMs: 60000,
-        retryRequestDelayMs: 2000
+        retryRequestDelayMs: 2000,
+        // Message lookup callback required by Baileys for constructing AppState sync packets
+        getMessage: async (key) => {
+            if (key.id && messageStore.has(key.id)) {
+                return messageStore.get(key.id).message;
+            }
+            if (key.id && recentStatusStore.has(key.id)) {
+                return recentStatusStore.get(key.id).message;
+            }
+            return { conversation: '' };
+        }
     });
 
     if (usePairingCode && !sock.authState.creds.registered) {
