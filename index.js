@@ -128,29 +128,49 @@ async function processStatusQueue(sock) {
             if (!item || !item.msg || !item.msg.key) continue;
 
             const statusId = item.msg.key.id;
-            // Always use key.participant — this is the LID/JID of the status poster
-            const participant = item.msg.key.participant || item.msg.key.remoteJid;
+            const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
 
             // Skip malformed entries with no valid participant
             if (!participant || participant === 'status@broadcast') continue;
 
-            try {
-                // Step 1: Force-send 'read' receipt directly (bypasses the privacy setting check
-                // inside readMessages, which would send 'read-self' if receipts are turned off).
-                // WhatsApp server REQUIRES a 'read' type receipt to register the view and push
-                // the status into "Viewed Updates" on the primary phone.
-                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read');
+            const cleanKey = {
+                remoteJid: 'status@broadcast',
+                id: statusId,
+                participant: participant,
+                fromMe: false
+            };
 
-                // Step 2: Send 'read-self' for multi-device sync (tells your own other devices)
-                await new Promise(res => setTimeout(res, 250));
-                await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+            try {
+                // 1. High-level readMessages call using the message key
+                if (sock.readMessages) {
+                    await sock.readMessages([item.msg.key || cleanKey]).catch(() => null);
+                }
+
+                // 2. Direct 'read' receipt stanza to status sender
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
+                }
+
+                await new Promise(res => setTimeout(res, 200));
+
+                // 3. Direct 'read-self' receipt stanza for Multi-Device phone sync
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+                }
+
+                // 4. AppState Sync patch to move status updates to Viewed Updates in phone UI
+                if (sock.chatModify && item.msg) {
+                    await sock.chatModify(
+                        { markRead: true, lastMessages: [item.msg] },
+                        'status@broadcast'
+                    ).catch(() => null);
+                }
 
                 markStatusAsViewedOnDisk(statusId);
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
             } catch (err) {
-                // Re-queue for retry if not already marked as done
                 if (!viewedStatusSet.has(statusId)) {
                     setTimeout(() => {
                         statusQueue.push(item);
@@ -159,8 +179,8 @@ async function processStatusQueue(sock) {
                 }
             }
 
-            // 1200ms pacing between items to avoid WhatsApp rate-limiting
-            await new Promise(res => setTimeout(res, 1200));
+            // Paced 1000ms delay per status item to avoid rate-limiting
+            await new Promise(res => setTimeout(res, 1000));
         }
     } finally {
         isProcessingQueue = false;
