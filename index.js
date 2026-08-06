@@ -73,7 +73,6 @@ function saveConfig() {
     } catch (e) {}
 }
 
-// Disk-backed memory so bot NEVER forgets viewed statuses across restarts
 let viewedStatusSet = new Set();
 if (fs.existsSync(viewedPath)) {
     try {
@@ -112,7 +111,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// RESILIENT STATUS QUEUE (Auto-Retry on Reconnects)
+// STATUS QUEUE (With Force Resync Capability)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -127,11 +126,11 @@ async function processStatusQueue(sock) {
 
         const statusId = item.msg.key.id;
 
-        // Skip if already processed and saved to disk
-        if (viewedStatusSet.has(statusId)) continue;
+        // Skip if already processed unless force-sweeping
+        if (!item.force && viewedStatusSet.has(statusId)) continue;
 
         try {
-            // 1. Fetch CDN media stream in memory to trigger CDN playback event
+            // 1. Fetch CDN media stream in memory
             if (item.msg.message) {
                 await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
             }
@@ -147,7 +146,6 @@ async function processStatusQueue(sock) {
             markStatusAsViewedOnDisk(statusId);
             console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${item.msg.key.participant}`);
         } catch (err) {
-            // Auto-retry in 2 seconds if socket was reconnecting
             if (!viewedStatusSet.has(statusId)) {
                 setTimeout(() => {
                     statusQueue.push(item);
@@ -162,13 +160,28 @@ async function processStatusQueue(sock) {
     isProcessingQueue = false;
 }
 
+// Normal status sweep
 async function sweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         if (!viewedStatusSet.has(id)) {
-            statusQueue.push({ msg });
+            statusQueue.push({ msg, force: false });
             count++;
         }
+    }
+    if (count > 0) {
+        processStatusQueue(sock);
+    }
+    return count;
+}
+
+// Special FORCE sweep (Re-views and resyncs EVERYTHING)
+async function forceSweepAndReadStatuses(sock) {
+    let count = 0;
+    for (const [id, msg] of recentStatusStore.entries()) {
+        viewedStatusSet.delete(id); // Clear viewed history for force re-view
+        statusQueue.push({ msg, force: true });
+        count++;
     }
     if (count > 0) {
         processStatusQueue(sock);
@@ -212,7 +225,7 @@ async function startBot() {
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
         shouldSyncHistoryMessage: () => false,
-        keepAliveIntervalMs: 15000, // 15-second keep-alive ping
+        keepAliveIntervalMs: 15000,
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000
     });
@@ -265,7 +278,6 @@ async function startBot() {
             activeSock = sock;
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
-            // Immediate catch-up sweep on connection
             sweepAndReadStatuses(sock);
 
             if (!config.NOTIFIED_STARTUP) {
@@ -283,10 +295,11 @@ async function startBot() {
                                                `• Anti-Delete: *${config.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
                                                `• *.alive* - Check bot uptime status\n` +
+                                               `• *.forceview* - Force re-view & resync all status updates\n` +
                                                `• *.sticker* | *.s* - Reply to photo/video to make sticker\n` +
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
                                                `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
-                                               `• *.viewall* - Manually sweep & re-view status updates\n` +
+                                               `• *.viewall* - Sweep unviewed status updates\n` +
                                                `• *.vv* - Reply to View-Once media to unlock silently\n` +
                                                `• *.save* - Reply to any message/media to save to DM\n` +
                                                `• *.settings* - View live dashboard & RAM usage`;
@@ -322,7 +335,7 @@ async function startBot() {
                 trackStatusKey(msg);
 
                 if (config.AUTO_STATUS_VIEW !== 'off') {
-                    statusQueue.push({ msg: msg });
+                    statusQueue.push({ msg: msg, force: false });
                     processStatusQueue(sock);
                 }
                 continue;
@@ -433,6 +446,13 @@ async function startBot() {
 
             // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
+                // SPECIAL COMMAND: .forceview (Re-reviews and forces phone resync for ALL statuses)
+                if (['.forceview', '.resync', '.review'].includes(command)) {
+                    const count = await forceSweepAndReadStatuses(sock);
+                    await sock.sendMessage(fromJid, { text: `Done! Force-reviewed and resynced ${count} status updates. 🚀` }, { quoted: msg });
+                    continue;
+                }
+
                 if (command === '.viewall' || command === '.readstatus') {
                     const count = await sweepAndReadStatuses(sock);
                     await sock.sendMessage(fromJid, { text: `Done! Swept and re-viewed ${count} status updates. ✅` }, { quoted: msg });
@@ -485,7 +505,7 @@ async function startBot() {
                                      `🗑️ *ANTI DELETE MSG:* ${config.ANTI_DELETE !== 'off' ? '✅ (' + config.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
-                                     `*Commands:* .alive, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
+                                     `*Commands:* .alive, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
 
                     await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
                     continue;
