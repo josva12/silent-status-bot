@@ -75,6 +75,7 @@ This bot is specifically optimized for VPS deployment (under 30 MB RAM footprint
 | Command | Usage | Description |
 | :--- | :--- | :--- |
 | **`.alive`** | `.alive` / `.ping` | Checks bot online status and uptime. |
+| **`.sticker`** | `.sticker` / `.s` | Reply to a photo or video to convert to a WebP sticker. |
 | **`.status`** | `.status no-dl` / `.status off` | Toggles status auto-viewing mode. |
 | **`.delete`** | `.delete p` / `.delete g` / `.delete off` | Toggles Anti-Delete mode (Private DM, Group, or Off). |
 | **`.viewall`** | `.viewall` | Manually sweeps and re-views all active 24h status updates. |
@@ -154,10 +155,10 @@ To keep the bot running continuously—even with your laptop lid closed—follow
 
 | Action | Command |
 | :--- | :--- |
-| **View Live Logs** | `pm2 logs silent-status` |
-| **Restart Bot** | `pm2 restart silent-status --update-env` |
+| **View Live Logs** | `pm2 logs silent-status-bot` |
+| **Restart Bot** | `pm2 restart silent-status-bot --update-env` |
 | **Check Status** | `pm2 status` |
-| **Stop Bot** | `pm2 stop silent-status` |
+| **Stop Bot** | `pm2 stop silent-status-bot` |
 
 ---
 
