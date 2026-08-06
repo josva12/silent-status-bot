@@ -77,6 +77,8 @@ const recentStatusStore = new Map();
 const viewedStatusIds = new Set();
 const startTime = Date.now();
 
+let activeSock = null;
+
 function trackStatusKey(msg) {
     if (!msg || !msg.key || !msg.key.id) return;
     recentStatusStore.set(msg.key.id, msg);
@@ -88,7 +90,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// STATUS QUEUE (CDN Media Stream Retrieval + Phone Sync)
+// STATUS QUEUE (With CDN Fetch & Multi-Device Phone Sync)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -102,7 +104,7 @@ async function processStatusQueue(sock) {
         if (!item || !item.msg || !item.msg.key) continue;
 
         try {
-            // 1. Fetch CDN media stream in memory to trigger WhatsApp CDN playback event
+            // 1. Fetch CDN media stream in memory for CDN playback event
             if (item.msg.message) {
                 await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
             }
@@ -110,7 +112,7 @@ async function processStatusQueue(sock) {
             // 2. High-level readMessages
             await sock.readMessages([item.msg.key]);
 
-            // 3. Multi-device read-self receipt node
+            // 3. Multi-device read-self receipt node (Triggers phone UI sync)
             if (sock.sendReceipt) {
                 await sock.sendReceipt('status@broadcast', item.msg.key.participant, [item.msg.key.id], 'read-self');
             }
@@ -126,7 +128,6 @@ async function processStatusQueue(sock) {
             }
         } catch (err) {}
 
-        // 100ms delay between stanzas
         await new Promise(res => setTimeout(res, 100));
     }
 
@@ -176,13 +177,15 @@ async function startBot() {
         }
     }
 
+    // High-frequency keep-alive ping prevents 428 connection closed drops
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
         shouldSyncHistoryMessage: () => false,
-        keepAliveIntervalMs: 30000,
-        connectTimeoutMs: 60000
+        keepAliveIntervalMs: 15000, // 15-second keep-alive ping
+        connectTimeoutMs: 60000,
+        retryRequestDelayMs: 2000
     });
 
     if (usePairingCode && !sock.authState.creds.registered) {
@@ -216,16 +219,22 @@ async function startBot() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-            if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
-                console.log(`[SOCKET RECONNECT] Refreshing connection (StatusCode: ${statusCode})...`);
+            // Clean up old socket listeners to prevent stale ratchet desync
+            if (activeSock) {
+                try {
+                    activeSock.ev.removeAllListeners();
+                    if (activeSock.ws) activeSock.ws.close();
+                } catch (e) {}
+                activeSock = null;
             }
 
             if (!isLoggedOut) {
-                setTimeout(() => startBot(), 2000);
+                setTimeout(() => startBot(), 3000); // 3s clean reconnect
             } else {
                 console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
             }
         } else if (connection === 'open') {
+            activeSock = sock;
             console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
             sweepAndReadStatuses(sock);
@@ -261,6 +270,7 @@ async function startBot() {
         }
     });
 
+    // 5-Minute Auto-Sweeper Timer
     setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off') {
             sweepAndReadStatuses(sock);
@@ -278,7 +288,7 @@ async function startBot() {
             const type = getContentType(msg.message);
             const isFromSudo = msg.key.fromMe || (msg.key.participant && sudoJid && msg.key.participant.includes(sudoJid.split('@')[0]));
 
-            // 1. SILENT AUTO STATUS VIEWER (With CDN Media Fetch)
+            // 1. SILENT AUTO STATUS VIEWER
             if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
 
