@@ -77,9 +77,9 @@ const recentStatusStore = new Map();
 const viewedStatusIds = new Set();
 const startTime = Date.now();
 
-function trackStatusKey(key) {
-    if (!key || !key.id) return;
-    recentStatusStore.set(key.id, key);
+function trackStatusKey(msg) {
+    if (!msg || !msg.key || !msg.key.id) return;
+    recentStatusStore.set(msg.key.id, msg);
 
     if (recentStatusStore.size > 1000) {
         const firstKey = recentStatusStore.keys().next().value;
@@ -88,7 +88,7 @@ function trackStatusKey(key) {
 }
 
 // =========================================================
-// STATUS QUEUE (With read-self Multi-Device Phone Sync)
+// STATUS QUEUE (CDN Media Stream Retrieval + Phone Sync)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -99,20 +99,25 @@ async function processStatusQueue(sock) {
 
     while (statusQueue.length > 0) {
         const item = statusQueue.shift();
-        if (!item || !item.key) continue;
+        if (!item || !item.msg || !item.msg.key) continue;
 
         try {
-            // 1. High-level readMessages (for contact view count)
-            await sock.readMessages([item.key]);
-
-            // 2. Multi-Device read-self receipt (syncs to phone UI "Viewed updates")
-            if (sock.sendReceipt) {
-                await sock.sendReceipt('status@broadcast', item.key.participant, [item.key.id], 'read-self');
+            // 1. Fetch CDN media stream in memory to trigger WhatsApp CDN playback event
+            if (item.msg.message) {
+                await downloadMediaMessage(item.msg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
             }
 
-            if (!viewedStatusIds.has(item.key.id)) {
-                viewedStatusIds.add(item.key.id);
-                console.log(`[STATUS VIEWED & SYNCED] ID: ${item.key.id} From: ${item.key.participant}`);
+            // 2. High-level readMessages
+            await sock.readMessages([item.msg.key]);
+
+            // 3. Multi-device read-self receipt node
+            if (sock.sendReceipt) {
+                await sock.sendReceipt('status@broadcast', item.msg.key.participant, [item.msg.key.id], 'read-self');
+            }
+
+            if (!viewedStatusIds.has(item.msg.key.id)) {
+                viewedStatusIds.add(item.msg.key.id);
+                console.log(`[STATUS VIEWED & SYNCED] ID: ${item.msg.key.id} From: ${item.msg.key.participant}`);
 
                 if (viewedStatusIds.size > 2000) {
                     const first = viewedStatusIds.values().next().value;
@@ -121,7 +126,8 @@ async function processStatusQueue(sock) {
             }
         } catch (err) {}
 
-        await new Promise(res => setTimeout(res, 50));
+        // 100ms delay between stanzas
+        await new Promise(res => setTimeout(res, 100));
     }
 
     isProcessingQueue = false;
@@ -129,8 +135,8 @@ async function processStatusQueue(sock) {
 
 async function sweepAndReadStatuses(sock) {
     let count = 0;
-    for (const [id, key] of recentStatusStore.entries()) {
-        statusQueue.push({ key });
+    for (const [id, msg] of recentStatusStore.entries()) {
+        statusQueue.push({ msg });
         count++;
     }
     if (count > 0) {
@@ -272,12 +278,12 @@ async function startBot() {
             const type = getContentType(msg.message);
             const isFromSudo = msg.key.fromMe || (msg.key.participant && sudoJid && msg.key.participant.includes(sudoJid.split('@')[0]));
 
-            // 1. SILENT AUTO STATUS VIEWER
+            // 1. SILENT AUTO STATUS VIEWER (With CDN Media Fetch)
             if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
-                trackStatusKey(msg.key);
+                trackStatusKey(msg);
 
                 if (config.AUTO_STATUS_VIEW !== 'off') {
-                    statusQueue.push({ key: msg.key });
+                    statusQueue.push({ msg: msg });
                     processStatusQueue(sock);
                 }
                 continue;
