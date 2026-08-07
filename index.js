@@ -113,7 +113,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (Rate-limited, with retry on failure)
+// PACED STATUS QUEUE (With Batch AppState Commit & Guard)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -121,6 +121,8 @@ let isProcessingQueue = false;
 async function processStatusQueue(sock) {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
+
+    let processedAny = false;
 
     try {
         while (statusQueue.length > 0) {
@@ -132,9 +134,6 @@ async function processStatusQueue(sock) {
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
 
-            // Skip malformed entries with no valid participant
-            if (!participant || participant === 'status@broadcast') continue;
-
             const cleanKey = {
                 remoteJid: 'status@broadcast',
                 id: statusId,
@@ -143,44 +142,31 @@ async function processStatusQueue(sock) {
             };
 
             try {
-                // 1. High-level readMessages call using the message key
-                if (sock.readMessages) {
-                    await sock.readMessages([item.msg.key || cleanKey]).catch(() => null);
-                }
+                await sock.readMessages([cleanKey]);
 
-                // 2. Direct 'read' receipt stanza to status sender
                 if (sock.sendReceipt) {
                     await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
                 }
 
-                await new Promise(res => setTimeout(res, 200));
+                await new Promise(res => setTimeout(res, 300));
 
-                // 3. Direct 'read-self' receipt stanza for Multi-Device phone sync
                 if (sock.sendReceipt) {
                     await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
                 }
 
-                // 4. AppState Sync patch to move status updates to Viewed Updates in phone UI
-                if (sock.chatModify && item.msg) {
-                    await sock.chatModify(
-                        { markRead: true, lastMessages: [item.msg] },
-                        'status@broadcast'
-                    ).catch(() => null);
-                }
-
                 markStatusAsViewedOnDisk(statusId);
+                processedAny = true;
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
-            } catch (err) {
-                if (!viewedStatusSet.has(statusId)) {
-                    setTimeout(() => {
-                        statusQueue.push(item);
-                        if (activeSock) processStatusQueue(activeSock);
-                    }, 3000);
-                }
-            }
+            } catch (err) {}
 
-            // Paced 1000ms delay per status item to avoid rate-limiting
-            await new Promise(res => setTimeout(res, 1000));
+            await new Promise(res => setTimeout(res, 1200));
+        }
+
+        if (processedAny && sock.chatModify) {
+            await sock.chatModify(
+                { markRead: true },
+                'status@broadcast'
+            ).catch(() => null);
         }
     } finally {
         isProcessingQueue = false;
@@ -332,6 +318,7 @@ async function startBot() {
                                                `• Anti-Delete: *${config.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
                                                `• *.alive* - Check bot uptime status\n` +
+                                               `• *.react <emoji>* | *.r* - Reply to any message to react with emoji\n` +
                                                `• *.forceview* - Force re-view & resync all status updates\n` +
                                                `• *.sticker* | *.s* - Reply to photo/video to make sticker\n` +
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
@@ -349,13 +336,11 @@ async function startBot() {
         }
     });
 
-    // Clear old timer on reconnect to prevent interval leaks
     if (sweeperInterval) {
         clearInterval(sweeperInterval);
         sweeperInterval = null;
     }
 
-    // 5-Minute Auto-Sweeper Timer
     sweeperInterval = setInterval(() => {
         if (config.AUTO_STATUS_VIEW !== 'off' && activeSock) {
             sweepAndReadStatuses(activeSock);
@@ -453,6 +438,36 @@ async function startBot() {
                 continue;
             }
 
+            // COMMAND: .react / .r (React to Quoted Message with Emoji)
+            if (['.react', '.r', '.reaction'].includes(command)) {
+                const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
+                const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
+
+                if (quotedInfo && quotedInfo.stanzaId) {
+                    try {
+                        const targetKey = {
+                            remoteJid: fromJid,
+                            id: quotedInfo.stanzaId,
+                            participant: quotedInfo.participant,
+                            fromMe: quotedInfo.participant === sudoJid
+                        };
+
+                        await sock.sendMessage(fromJid, {
+                            react: {
+                                text: reactionEmoji,
+                                key: targetKey
+                            }
+                        });
+                        console.log(`[.react COMMAND] Reacted with ${reactionEmoji}`);
+                    } catch (err) {
+                        console.error('.react command error:', err);
+                    }
+                } else {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a message with `.react <emoji>`' }, { quoted: msg });
+                }
+                continue;
+            }
+
             // COMMAND: .sticker / .s (Photo/Video to Sticker Maker)
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
@@ -547,7 +562,7 @@ async function startBot() {
                                      `🗑️ *ANTI DELETE MSG:* ${config.ANTI_DELETE !== 'off' ? '✅ (' + config.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
-                                     `*Commands:* .alive, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
+                                     `*Commands:* .alive, .react, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
 
                     await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
                     continue;
