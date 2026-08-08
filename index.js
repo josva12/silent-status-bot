@@ -48,24 +48,34 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION & VIEWED STATUS TRACKER
+// PERSISTENT USER CONFIGURATION (Git Ignored & Disk Backed)
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
 
-let config = {
-    AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
-    ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
-    NOTIFIED_STARTUP: false    // Sent once on Day 1, saved to disk
-};
+function loadConfig() {
+    let defaultConfig = {
+        AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
+        ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
+        NOTIFIED_STARTUP: false
+    };
 
-if (fs.existsSync(configPath)) {
-    try {
-        config = { ...config, ...JSON.parse(fs.readFileSync(configPath, 'utf-8')) };
-    } catch (e) {}
-} else {
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    if (fs.existsSync(configPath)) {
+        try {
+            const savedData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            return { ...defaultConfig, ...savedData };
+        } catch (e) {
+            return defaultConfig;
+        }
+    } else {
+        try {
+            fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2));
+        } catch (e) {}
+        return defaultConfig;
+    }
 }
+
+let config = loadConfig();
 
 function saveConfig() {
     try {
@@ -113,7 +123,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (With Batch AppState Commit & Guard)
+// PACED STATUS QUEUE (AppState Sync & Guard)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -201,6 +211,9 @@ async function forceSweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
+    // Reload config from disk on startup
+    config = loadConfig();
+
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');

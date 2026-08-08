@@ -1,6 +1,7 @@
 node_modules/
 auth_info/
 vps_status_cache/
+config.json
+viewed_statuses.json
 .env
 *.log
-config.json
