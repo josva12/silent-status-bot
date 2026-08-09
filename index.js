@@ -48,12 +48,12 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT USER CONFIGURATION (Git Ignored & Disk Backed)
+// HARDENED CONFIGURATION MANAGER (Disk Backed)
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
 
-function loadConfig() {
+function getConfig() {
     let defaultConfig = {
         AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
         ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
@@ -75,12 +75,15 @@ function loadConfig() {
     }
 }
 
-let config = loadConfig();
-
-function saveConfig() {
+function updateConfig(newSettings) {
+    const current = getConfig();
+    const updated = { ...current, ...newSettings };
     try {
-        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-    } catch (e) {}
+        fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
+    } catch (e) {
+        console.error('Failed to write config.json:', e);
+    }
+    return updated;
 }
 
 let viewedStatusSet = new Set();
@@ -129,6 +132,12 @@ const statusQueue = [];
 let isProcessingQueue = false;
 
 async function processStatusQueue(sock) {
+    const activeConfig = getConfig();
+    if (activeConfig.AUTO_STATUS_VIEW === 'off') {
+        statusQueue.length = 0; // Empty queue if turned off
+        return;
+    }
+
     if (isProcessingQueue) return;
     isProcessingQueue = true;
 
@@ -136,6 +145,12 @@ async function processStatusQueue(sock) {
 
     try {
         while (statusQueue.length > 0) {
+            const currentCfg = getConfig();
+            if (currentCfg.AUTO_STATUS_VIEW === 'off') {
+                statusQueue.length = 0;
+                break;
+            }
+
             const item = statusQueue.shift();
             if (!item || !item.msg || !item.msg.key) continue;
 
@@ -184,6 +199,9 @@ async function processStatusQueue(sock) {
 }
 
 async function sweepAndReadStatuses(sock) {
+    const activeConfig = getConfig();
+    if (activeConfig.AUTO_STATUS_VIEW === 'off') return 0;
+
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         if (!viewedStatusSet.has(id)) {
@@ -198,6 +216,9 @@ async function sweepAndReadStatuses(sock) {
 }
 
 async function forceSweepAndReadStatuses(sock) {
+    const activeConfig = getConfig();
+    if (activeConfig.AUTO_STATUS_VIEW === 'off') return 0;
+
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         viewedStatusSet.delete(id);
@@ -211,9 +232,7 @@ async function forceSweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
-    // Reload config from disk on startup
-    config = loadConfig();
-
+    const activeConfig = getConfig();
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -314,21 +333,23 @@ async function startBot() {
                 console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
             }
 
-            sweepAndReadStatuses(sock);
+            if (getConfig().AUTO_STATUS_VIEW !== 'off') {
+                sweepAndReadStatuses(sock);
+            }
 
-            if (!config.NOTIFIED_STARTUP) {
-                config.NOTIFIED_STARTUP = true;
-                saveConfig();
+            if (!getConfig().NOTIFIED_STARTUP) {
+                updateConfig({ NOTIFIED_STARTUP: true });
 
                 setTimeout(async () => {
                     try {
+                        const currentCfg = getConfig();
                         const sudoJid = sock.user ? (sock.user.id.split(':')[0] + '@s.whatsapp.net') : null;
                         if (sudoJid) {
                             const notifyText = `🚀 *SILENT STATUS BOT IS ONLINE*\n` +
                                                `_Designed by Josva_\n\n` +
                                                `⚙️ *ACTIVE SETTINGS:*\n` +
-                                               `• Status View: *${config.AUTO_STATUS_VIEW}*\n` +
-                                               `• Anti-Delete: *${config.ANTI_DELETE}*\n\n` +
+                                               `• Status View: *${currentCfg.AUTO_STATUS_VIEW}*\n` +
+                                               `• Anti-Delete: *${currentCfg.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
                                                `• *.alive* - Check bot uptime status\n` +
                                                `• *.react <emoji>* | *.r* - Reply to any message to react with emoji\n` +
@@ -354,8 +375,10 @@ async function startBot() {
         sweeperInterval = null;
     }
 
+    // 5-Minute Auto-Sweeper Timer (Strictly checks config)
     sweeperInterval = setInterval(() => {
-        if (config.AUTO_STATUS_VIEW !== 'off' && activeSock) {
+        const currentCfg = getConfig();
+        if (currentCfg.AUTO_STATUS_VIEW !== 'off' && activeSock) {
             sweepAndReadStatuses(activeSock);
         }
     }, 5 * 60 * 1000);
@@ -375,7 +398,8 @@ async function startBot() {
             if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
 
-                if (config.AUTO_STATUS_VIEW !== 'off') {
+                const currentCfg = getConfig();
+                if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
                     statusQueue.push({ msg: msg, force: false });
                     processStatusQueue(sock);
                 }
@@ -397,13 +421,14 @@ async function startBot() {
             }
 
             // 2. ANTI-DELETE LISTENER
-            if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && config.ANTI_DELETE !== 'off') {
+            const activeAntiDelete = getConfig().ANTI_DELETE;
+            if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
                 const deletedMsg = messageStore.get(deletedKey.id);
 
                 if (deletedMsg) {
                     try {
-                        const targetChat = config.ANTI_DELETE === 'g' ? fromJid : sudoJid;
+                        const targetChat = activeAntiDelete === 'g' ? fromJid : sudoJid;
                         const sender = deletedMsg.participant.split('@')[0];
                         const header = `🗑️ *Anti-Delete Alert*\n👤 *Sender:* @${sender}\n💬 *Chat:* ${isGroup ? 'Group' : 'Private'}\n\n`;
 
@@ -531,39 +556,38 @@ async function startBot() {
 
                 if (command === '.status') {
                     if (['no-dl', 'on', 'true'].includes(param)) {
-                        config.AUTO_STATUS_VIEW = 'no-dl';
-                        saveConfig();
+                        updateConfig({ AUTO_STATUS_VIEW: 'no-dl' });
                         await sock.sendMessage(fromJid, { text: 'Done! Status View: [no-dl] ✅' }, { quoted: msg });
                     } else if (['off', 'false'].includes(param)) {
-                        config.AUTO_STATUS_VIEW = 'off';
-                        saveConfig();
-                        await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑' }, { quoted: msg });
+                        updateConfig({ AUTO_STATUS_VIEW: 'off' });
+                        statusQueue.length = 0; // Clear queue immediately
+                        await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, { quoted: msg });
                     } else {
-                        await sock.sendMessage(fromJid, { text: `Current Setting: Status View = [${config.AUTO_STATUS_VIEW}]\nUsage: .status no-dl | .status off` }, { quoted: msg });
+                        const currentCfg = getConfig();
+                        await sock.sendMessage(fromJid, { text: `Current Setting: Status View = [${currentCfg.AUTO_STATUS_VIEW}]\nUsage: .status no-dl | .status off` }, { quoted: msg });
                     }
                     continue;
                 }
 
                 if (command === '.delete') {
                     if (param === 'p') {
-                        config.ANTI_DELETE = 'p';
-                        saveConfig();
+                        updateConfig({ ANTI_DELETE: 'p' });
                         await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [p] (Send to SUDO DM) 🗑️' }, { quoted: msg });
                     } else if (param === 'g') {
-                        config.ANTI_DELETE = 'g';
-                        saveConfig();
+                        updateConfig({ ANTI_DELETE: 'g' });
                         await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [g] (Send to Same Group) 🗑️' }, { quoted: msg });
                     } else if (['off', 'false'].includes(param)) {
-                        config.ANTI_DELETE = 'off';
-                        saveConfig();
+                        updateConfig({ ANTI_DELETE: 'off' });
                         await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [off] 🛑' }, { quoted: msg });
                     } else {
-                        await sock.sendMessage(fromJid, { text: `Current Setting: Anti-Delete = [${config.ANTI_DELETE}]\nUsage: .delete p | .delete g | .delete off` }, { quoted: msg });
+                        const currentCfg = getConfig();
+                        await sock.sendMessage(fromJid, { text: `Current Setting: Anti-Delete = [${currentCfg.ANTI_DELETE}]\nUsage: .delete p | .delete g | .delete off` }, { quoted: msg });
                     }
                     continue;
                 }
 
                 if (['.menu', '.settings', '.vars', '.help'].includes(command)) {
+                    const currentCfg = getConfig();
                     const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                     const hours = Math.floor(uptimeSec / 3600);
                     const minutes = Math.floor((uptimeSec % 3600) / 60);
@@ -571,8 +595,8 @@ async function startBot() {
 
                     const menuText = `⚙️ *BOT SETTINGS & STATUS*\n\n` +
                                      `🛡️ *SUDO:* +${sudoJid ? sudoJid.split('@')[0] : 'Owner'}\n` +
-                                     `👀 *AUTO STATUS VIEW:* ${config.AUTO_STATUS_VIEW !== 'off' ? '✅ (' + config.AUTO_STATUS_VIEW + ')' : '❎ (off)'}\n` +
-                                     `🗑️ *ANTI DELETE MSG:* ${config.ANTI_DELETE !== 'off' ? '✅ (' + config.ANTI_DELETE + ')' : '❎ (off)'}\n` +
+                                     `👀 *AUTO STATUS VIEW:* ${currentCfg.AUTO_STATUS_VIEW !== 'off' ? '✅ (' + currentCfg.AUTO_STATUS_VIEW + ')' : '❎ (off)'}\n` +
+                                     `🗑️ *ANTI DELETE MSG:* ${currentCfg.ANTI_DELETE !== 'off' ? '✅ (' + currentCfg.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
                                      `*Commands:* .alive, .react, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
