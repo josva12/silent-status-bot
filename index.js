@@ -126,7 +126,7 @@ function trackStatusKey(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (AppState Sync & Guard)
+// PACED STATUS QUEUE (Clean Native Read Receipts)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -134,14 +134,12 @@ let isProcessingQueue = false;
 async function processStatusQueue(sock) {
     const activeConfig = getConfig();
     if (activeConfig.AUTO_STATUS_VIEW === 'off') {
-        statusQueue.length = 0; // Empty queue if turned off
+        statusQueue.length = 0;
         return;
     }
 
     if (isProcessingQueue) return;
     isProcessingQueue = true;
-
-    let processedAny = false;
 
     try {
         while (statusQueue.length > 0) {
@@ -158,6 +156,7 @@ async function processStatusQueue(sock) {
             const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
+            if (!participant || participant === 'status@broadcast') continue;
 
             const cleanKey = {
                 remoteJid: 'status@broadcast',
@@ -167,31 +166,29 @@ async function processStatusQueue(sock) {
             };
 
             try {
-                await sock.readMessages([cleanKey]);
+                // 1. Native readMessages call
+                if (sock.readMessages) {
+                    await sock.readMessages([cleanKey]);
+                }
 
+                // 2. Direct read receipt stanza to status sender
                 if (sock.sendReceipt) {
                     await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
                 }
 
-                await new Promise(res => setTimeout(res, 300));
-
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
-                }
-
                 markStatusAsViewedOnDisk(statusId);
-                processedAny = true;
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
-            } catch (err) {}
+            } catch (err) {
+                if (!viewedStatusSet.has(statusId)) {
+                    setTimeout(() => {
+                        statusQueue.push(item);
+                        if (activeSock) processStatusQueue(activeSock);
+                    }, 3000);
+                }
+            }
 
-            await new Promise(res => setTimeout(res, 1200));
-        }
-
-        if (processedAny && sock.chatModify) {
-            await sock.chatModify(
-                { markRead: true },
-                'status@broadcast'
-            ).catch(() => null);
+            // Paced 500ms delay per status item to avoid rate-limiting
+            await new Promise(res => setTimeout(res, 500));
         }
     } finally {
         isProcessingQueue = false;
@@ -232,7 +229,8 @@ async function forceSweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
-    const activeConfig = getConfig();
+    config = getConfig();
+
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -375,7 +373,6 @@ async function startBot() {
         sweeperInterval = null;
     }
 
-    // 5-Minute Auto-Sweeper Timer (Strictly checks config)
     sweeperInterval = setInterval(() => {
         const currentCfg = getConfig();
         if (currentCfg.AUTO_STATUS_VIEW !== 'off' && activeSock) {
