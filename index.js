@@ -8,6 +8,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const os = require('os');
+const qrcode = require('qrcode-terminal');
 
 // Logger configuration
 const logger = pino({ level: 'silent' });
@@ -21,6 +22,7 @@ process.stderr.write = function (chunk, encoding, callback) {
         str.includes('SessionEntry') ||
         str.includes('MessageCounterError') ||
         str.includes('Failed to decrypt') ||
+        str.includes('printQRInTerminal option has been deprecated') ||
         str.includes('428')
     ) {
         return true;
@@ -48,9 +50,6 @@ function getSenderJid(msg) {
     return msg.key.participant || msg.key.remoteJid;
 }
 
-/**
- * Unwrap message layers without destroying root media types
- */
 function unwrapMessage(msg) {
     let m = msg;
     if (!m) return null;
@@ -76,7 +75,6 @@ async function startBot() {
     const sock = makeWASocket({
         version,
         logger,
-        printQRInTerminal: true,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -87,9 +85,16 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Connection Manager
+    // Connection Manager & QR Code Handler
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+
+        // Render QR Code in terminal if generated
+        if (qr) {
+            console.log('\n--- SCAN THIS QR CODE TO LINK WHATSAPP ---');
+            qrcode.generate(qr, { small: true });
+        }
+
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -97,7 +102,7 @@ async function startBot() {
                 console.log(`[RECONNECTING] Reason code: ${statusCode || 'Unknown'}`);
                 startBot();
             } else {
-                console.log('Session logged out. Clean ./session and re-scan QR.');
+                console.log('Session logged out. Clean ./session and re-scan QR or use pairing code.');
             }
         } else if (connection === 'open') {
             console.log('✅ Silent Status Bot Active! Designed by Josva.');
@@ -131,7 +136,7 @@ async function startBot() {
                         // Mark read on WhatsApp servers
                         await sock.readMessages([msg.key]);
 
-                        // Broadcast read-self frame to primary device so phone shifts status to "Viewed"
+                        // Broadcast read-self frame to primary device
                         await sock.sendReceipt(
                             msg.key.remoteJid,
                             participant,
@@ -139,7 +144,7 @@ async function startBot() {
                             'read-self'
                         );
 
-                        console.log(`[STATUS VIEWED & SYNCED TO PHONE] ID: ${msg.key.id} From: ${participant}`);
+                        console.log(`[STATUS VIEWED & SYNCED] ID: ${msg.key.id} From: ${participant}`);
                     }
                     continue;
                 }
@@ -173,7 +178,7 @@ async function startBot() {
 
                 const quotedMsg = contextInfo ? unwrapMessage(contextInfo.quotedMessage) : null;
 
-                // --- IN-CHAT COMMANDS (SUDO / OWNER ONLY) ---
+                // --- IN-CHAT COMMANDS ---
 
                 // .alive / .ping
                 if (command === '.alive' || command === '.ping') {
