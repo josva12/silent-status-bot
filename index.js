@@ -4,7 +4,8 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-    downloadContentFromMessage
+    downloadContentFromMessage,
+    WA_DEFAULT_EPHEMERAL
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const os = require('os');
@@ -13,7 +14,7 @@ const qrcode = require('qrcode-terminal');
 // Logger configuration
 const logger = pino({ level: 'silent' });
 
-// Low-level stderr interceptor to keep logs clean
+// Intercept low-level stderr warnings
 const origStderrWrite = process.stderr.write;
 process.stderr.write = function (chunk, encoding, callback) {
     const str = chunk.toString();
@@ -40,10 +41,9 @@ process.on('unhandledRejection', (reason) => {
 const startTime = Date.now();
 const config = {
     autoViewStatus: true,
-    antiDeleteMode: 'g' // 'p' = personal, 'g' = groups/all, 'off' = disabled
+    antiDeleteMode: 'g'
 };
 
-// In-Memory Message Store for Anti-Delete functionality
 const messageStore = new Map();
 
 function getSenderJid(msg) {
@@ -80,16 +80,18 @@ async function startBot() {
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
         generateHighQualityLinkPreview: true,
-        syncFullHistory: false
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        // Ensures key exchange payloads are sent cleanly to self/primary devices
+        emitOwnEvents: true 
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Connection Manager & QR Code Handler
+    // Connection Manager
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Render QR Code in terminal if generated
         if (qr) {
             console.log('\n--- SCAN THIS QR CODE TO LINK WHATSAPP ---');
             qrcode.generate(qr, { small: true });
@@ -102,14 +104,14 @@ async function startBot() {
                 console.log(`[RECONNECTING] Reason code: ${statusCode || 'Unknown'}`);
                 startBot();
             } else {
-                console.log('Session logged out. Clean ./session and re-scan QR or use pairing code.');
+                console.log('Session logged out. Clear ./session directory and restart.');
             }
         } else if (connection === 'open') {
             console.log('✅ Silent Status Bot Active! Designed by Josva.');
         }
     });
 
-    // Message & Status Processing Engine
+    // Message Processing Engine
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             for (const msg of chatUpdate.messages) {
@@ -119,7 +121,6 @@ async function startBot() {
                 const isGroup = remoteJid.endsWith('@g.us');
                 const isStatus = remoteJid === 'status@broadcast';
 
-                // Store messages for Anti-Delete lookup
                 if (!isStatus && msg.key.id) {
                     messageStore.set(msg.key.id, msg);
                     if (messageStore.size > 2000) {
@@ -128,28 +129,22 @@ async function startBot() {
                     }
                 }
 
-                // 1. AUTO-VIEW STATUSES & SYNC TO PHONE APP
+                // Auto-View Statuses
                 if (isStatus) {
                     if (config.autoViewStatus) {
                         const participant = getSenderJid(msg);
-
-                        // Mark read on WhatsApp servers
                         await sock.readMessages([msg.key]);
-
-                        // Broadcast read-self frame to primary device
                         await sock.sendReceipt(
                             msg.key.remoteJid,
                             participant,
                             [msg.key.id],
                             'read-self'
                         );
-
                         console.log(`[STATUS VIEWED & SYNCED] ID: ${msg.key.id} From: ${participant}`);
                     }
                     continue;
                 }
 
-                // Command Parsing Setup
                 const rawMessage = unwrapMessage(msg.message);
                 if (!rawMessage) continue;
 
@@ -165,9 +160,6 @@ async function startBot() {
                 const subArg = args[1]?.toLowerCase();
 
                 const senderJid = getSenderJid(msg);
-                const ownerJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-
-                // Restrict commands to bot owner/SUDO
                 const isOwner = msg.key.fromMe || senderJid.includes(sock.user.id.split(':')[0]);
                 if (!isOwner) continue;
 
@@ -177,10 +169,10 @@ async function startBot() {
                     rawMessage.audioMessage?.contextInfo;
 
                 const quotedMsg = contextInfo ? unwrapMessage(contextInfo.quotedMessage) : null;
+                const ownerJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
 
                 // --- IN-CHAT COMMANDS ---
 
-                // .alive / .ping
                 if (command === '.alive' || command === '.ping') {
                     const statusText = `🤖 *Silent Status Bot is Active*\n\n` +
                         `⏱️ *Uptime:* ${getUptime()}\n` +
@@ -191,13 +183,12 @@ async function startBot() {
                     continue;
                 }
 
-                // .sticker / .s
                 if (command === '.sticker' || command === '.s') {
                     const targetMsg = quotedMsg || rawMessage;
                     const mediaType = targetMsg.imageMessage ? 'image' : targetMsg.videoMessage ? 'video' : null;
 
                     if (!mediaType) {
-                        await sock.sendMessage(remoteJid, { text: '⚠️ Please reply to an image or short video with *.sticker* or *.s*' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '⚠️ Reply to an image or short video with *.sticker*' }, { quoted: msg });
                         continue;
                     }
 
@@ -212,48 +203,44 @@ async function startBot() {
                     continue;
                 }
 
-                // .status no-dl / .status off / .status on
                 if (command === '.status') {
                     if (subArg === 'off' || subArg === 'no-dl') {
                         config.autoViewStatus = false;
-                        await sock.sendMessage(remoteJid, { text: '🔴 Auto Status Viewing has been *DISABLED*.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '🔴 Auto Status Viewing *DISABLED*.' }, { quoted: msg });
                     } else if (subArg === 'on') {
                         config.autoViewStatus = true;
-                        await sock.sendMessage(remoteJid, { text: '🟢 Auto Status Viewing has been *ENABLED*.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '🟢 Auto Status Viewing *ENABLED*.' }, { quoted: msg });
                     } else {
-                        await sock.sendMessage(remoteJid, { text: `ℹ️ Usage: *.status on* | *.status off* | *.status no-dl*` }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: 'ℹ️ Usage: *.status on* | *.status off*' }, { quoted: msg });
                     }
                     continue;
                 }
 
-                // .delete p / .delete g / .delete off
                 if (command === '.delete' || command === '.antidelete') {
                     if (subArg === 'p') {
                         config.antiDeleteMode = 'p';
-                        await sock.sendMessage(remoteJid, { text: '🛡️ Anti-Delete active for *PRIVATE DM ONLY*.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '🛡️ Anti-Delete set to *PRIVATE DM ONLY*.' }, { quoted: msg });
                     } else if (subArg === 'g') {
                         config.antiDeleteMode = 'g';
-                        await sock.sendMessage(remoteJid, { text: '🛡️ Anti-Delete active for *GROUPS & PRIVATE DMs*.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '🛡️ Anti-Delete set to *GROUPS & PRIVATE DMs*.' }, { quoted: msg });
                     } else if (subArg === 'off') {
                         config.antiDeleteMode = 'off';
-                        await sock.sendMessage(remoteJid, { text: '🔴 Anti-Delete mode has been *DISABLED*.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '🔴 Anti-Delete *DISABLED*.' }, { quoted: msg });
                     } else {
-                        await sock.sendMessage(remoteJid, { text: `ℹ️ Usage: *.delete p* (Private) | *.delete g* (Group/All) | *.delete off*` }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: 'ℹ️ Usage: *.delete p* | *.delete g* | *.delete off*' }, { quoted: msg });
                     }
                     continue;
                 }
 
-                // .viewall
                 if (command === '.viewall') {
-                    await sock.sendMessage(remoteJid, { text: '🔄 *Sweeping and re-viewing active 24h status updates...*' }, { quoted: msg });
-                    await sock.sendMessage(remoteJid, { text: '✅ *All active status updates have been viewed & synced.*' }, { quoted: msg });
+                    await sock.sendMessage(remoteJid, { text: '🔄 *Sweeping status updates...*' }, { quoted: msg });
+                    await sock.sendMessage(remoteJid, { text: '✅ *Status updates synced.*' }, { quoted: msg });
                     continue;
                 }
 
-                // .vv
                 if (command === '.vv') {
                     if (!quotedMsg) {
-                        await sock.sendMessage(remoteJid, { text: '⚠️ Please reply to a View-Once media message with *.vv*' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '⚠️ Reply to a View-Once message with *.vv*' }, { quoted: msg });
                         continue;
                     }
 
@@ -261,17 +248,12 @@ async function startBot() {
                     const mediaObj = quotedMsg[mediaTypeKey];
 
                     if (!mediaTypeKey || !mediaObj) {
-                        await sock.sendMessage(remoteJid, { text: '⚠️ Quoted message contains no media.' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '⚠️ Message contains no media.' }, { quoted: msg });
                         continue;
                     }
 
                     const typeMap = { imageMessage: 'image', videoMessage: 'video', audioMessage: 'audio' };
                     const downloadType = typeMap[mediaTypeKey];
-
-                    if (!downloadType) {
-                        await sock.sendMessage(remoteJid, { text: '⚠️ Unsupported media format.' }, { quoted: msg });
-                        continue;
-                    }
 
                     const stream = await downloadContentFromMessage(mediaObj, downloadType);
                     let buffer = Buffer.alloc(0);
@@ -287,10 +269,9 @@ async function startBot() {
                     continue;
                 }
 
-                // .save
                 if (command === '.save') {
                     if (!quotedMsg) {
-                        await sock.sendMessage(remoteJid, { text: '⚠️ Reply to any media or text message with *.save*' }, { quoted: msg });
+                        await sock.sendMessage(remoteJid, { text: '⚠️ Reply to any message with *.save*' }, { quoted: msg });
                         continue;
                     }
 
@@ -315,11 +296,10 @@ async function startBot() {
                         await sock.sendMessage(ownerJid, { text: `📥 *Saved Note:*\n\n${textContent}` });
                     }
 
-                    await sock.sendMessage(remoteJid, { text: '📥 Saved directly to your private SUDO DM!' }, { quoted: msg });
+                    await sock.sendMessage(remoteJid, { text: '📥 Saved to your private DM!' }, { quoted: msg });
                     continue;
                 }
 
-                // .settings / .menu / .vars
                 if (command === '.settings' || command === '.menu' || command === '.vars') {
                     const totalMemGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(2);
                     const freeMemGB = (os.freemem() / 1024 / 1024 / 1024).toFixed(2);
@@ -343,7 +323,7 @@ async function startBot() {
         }
     });
 
-    // Anti-Delete Revoke Detector
+    // Anti-Delete Detector
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (update.update.protocolMessage?.type === 0) {
