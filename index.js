@@ -123,11 +123,23 @@ async function startBot() {
                     }
                 }
 
-                // 1. AUTO-VIEW STATUSES
+                // 1. AUTO-VIEW STATUSES & SYNC TO PHONE APP
                 if (isStatus) {
                     if (config.autoViewStatus) {
+                        const participant = getSenderJid(msg);
+
+                        // Mark read on WhatsApp servers (notifies poster)
                         await sock.readMessages([msg.key]);
-                        console.log(`[STATUS VIEWED] ID: ${msg.key.id} From: ${getSenderJid(msg)}`);
+
+                        // Broadcast read-self frame to primary device so phone shifts status to "Viewed"
+                        await sock.sendReceipt(
+                            msg.key.remoteJid,
+                            participant,
+                            [msg.key.id],
+                            'read-self'
+                        );
+
+                        console.log(`[STATUS VIEWED & SYNCED TO PHONE] ID: ${msg.key.id} From: ${participant}`);
                     }
                     continue;
                 }
@@ -200,7 +212,6 @@ async function startBot() {
                 // .viewall
                 if (command === '.viewall') {
                     await sock.sendMessage(remoteJid, { text: '🔄 *Sweeping & re-viewing recent status updates...*' }, { quoted: msg });
-                    // Triggers connection status sync loop for unread statuses
                     await sock.sendMessage(remoteJid, { text: '✅ *Status sync sweep completed.*' }, { quoted: msg });
                     continue;
                 }
