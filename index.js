@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType } = require('@whiskeysockets/baileys');
 const qrcodeTerminal = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
@@ -98,7 +98,7 @@ function markStatusAsViewedOnDisk(id) {
     if (!id) return;
     viewedStatusSet.add(id);
 
-    if (viewedStatusSet.size > 5000) {
+    if (viewedStatusSet.size > 3000) {
         const first = viewedStatusSet.values().next().value;
         viewedStatusSet.delete(first);
     }
@@ -119,7 +119,7 @@ function trackStatusKey(msg) {
     if (!msg || !msg.key || !msg.key.id) return;
     recentStatusStore.set(msg.key.id, msg);
 
-    if (recentStatusStore.size > 2000) {
+    if (recentStatusStore.size > 1000) {
         const firstKey = recentStatusStore.keys().next().value;
         recentStatusStore.delete(firstKey);
     }
@@ -134,7 +134,7 @@ let isProcessingQueue = false;
 async function processStatusQueue(sock) {
     const activeConfig = getConfig();
     if (activeConfig.AUTO_STATUS_VIEW === 'off') {
-        statusQueue.length = 0;
+        statusQueue.length = 0; // Empty queue if turned off
         return;
     }
 
@@ -184,7 +184,7 @@ async function processStatusQueue(sock) {
                 console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
             } catch (err) {}
 
-            await new Promise(res => setTimeout(res, 800));
+            await new Promise(res => setTimeout(res, 1200));
         }
 
         if (processedAny && sock.chatModify) {
@@ -236,7 +236,6 @@ async function startBot() {
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
     
     let usePairingCode = false;
     let userPhoneNumber = '';
@@ -265,18 +264,12 @@ async function startBot() {
     }
 
     const sock = makeWASocket({
-        version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
-        },
+        auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
         keepAliveIntervalMs: 30000,
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000,
-        syncFullHistory: false,
-        emitOwnEvents: true,
         getMessage: async (key) => {
             if (key.id && messageStore.has(key.id)) {
                 return messageStore.get(key.id).message;
@@ -382,44 +375,13 @@ async function startBot() {
         sweeperInterval = null;
     }
 
-    // 5-Minute Auto-Sweeper Timer
+    // 5-Minute Auto-Sweeper Timer (Strictly checks config)
     sweeperInterval = setInterval(() => {
         const currentCfg = getConfig();
         if (currentCfg.AUTO_STATUS_VIEW !== 'off' && activeSock) {
             sweepAndReadStatuses(activeSock);
         }
     }, 5 * 60 * 1000);
-
-    // =========================================================
-    // DELAYED DECRYPTION LISTENER (Catches updates after 1-5 hours)
-    // =========================================================
-    sock.ev.on('messages.update', async (updates) => {
-        for (const update of updates) {
-            if (!update.update || !update.key || !update.key.id) continue;
-
-            const msgId = update.key.id;
-            const fromJid = update.key.remoteJid;
-
-            if (messageStore.has(msgId) && update.update.message) {
-                const existing = messageStore.get(msgId);
-                existing.message = update.update.message;
-                messageStore.set(msgId, existing);
-            }
-
-            if (fromJid === 'status@broadcast' && update.update.message) {
-                const existingStatus = recentStatusStore.get(msgId) || { key: update.key, message: update.update.message };
-                existingStatus.message = update.update.message;
-                recentStatusStore.set(msgId, existingStatus);
-
-                const currentCfg = getConfig();
-                if (currentCfg.AUTO_STATUS_VIEW !== 'off' && !viewedStatusSet.has(msgId)) {
-                    console.log(`[DELAYED DECRYPTION RESOLVED] Status ${msgId} ready after delay.`);
-                    statusQueue.push({ msg: existingStatus, force: false });
-                    processStatusQueue(sock);
-                }
-            }
-        }
-    });
 
     sock.ev.on('messages.upsert', async (m) => {
         const sudoJid = sock.user ? (sock.user.id.split(':')[0] + '@s.whatsapp.net') : null;
@@ -452,7 +414,7 @@ async function startBot() {
                     participant: msg.key.participant || fromJid
                 });
 
-                if (messageStore.size > 500) {
+                if (messageStore.size > 300) {
                     const firstKey = messageStore.keys().next().value;
                     messageStore.delete(firstKey);
                 }
@@ -514,7 +476,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .react / .r
+            // COMMAND: .react / .r (React to Quoted Message with Emoji)
             if (['.react', '.r', '.reaction'].includes(command)) {
                 const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
                 const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -544,7 +506,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .sticker / .s
+            // COMMAND: .sticker / .s (Photo/Video to Sticker Maker)
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
                 const mediaType = quotedMsg ? getContentType(quotedMsg) : type;
@@ -598,7 +560,7 @@ async function startBot() {
                         await sock.sendMessage(fromJid, { text: 'Done! Status View: [no-dl] ✅' }, { quoted: msg });
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
-                        statusQueue.length = 0;
+                        statusQueue.length = 0; // Clear queue immediately
                         await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, { quoted: msg });
                     } else {
                         const currentCfg = getConfig();
