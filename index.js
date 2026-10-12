@@ -294,17 +294,11 @@ async function startBot() {
                     return messageStore.get(compositeKey).message;
                 }
             }
-            if (key.id) {
-                for (const [k, v] of messageStore.entries()) {
-                    if (k.endsWith(`_${key.id}`)) {
-                        return v.message;
-                    }
-                }
-                if (recentStatusStore.has(key.id)) {
-                    return recentStatusStore.get(key.id).message;
-                }
+            if (key.id && recentStatusStore.has(key.id)) {
+                return recentStatusStore.get(key.id).message;
             }
-            return { conversation: '' };
+            console.warn(`[GET_MESSAGE CACHE MISS] ID: ${key.id} RemoteJid: ${key.remoteJid || 'unknown'}`);
+            return null;
         }
     });
 
@@ -434,7 +428,7 @@ async function startBot() {
                 continue;
             }
 
-            // Cache incoming chat messages with composite key for Anti-Delete
+            // Cache incoming chat messages with strict composite key
             if (msg.key.id && fromJid !== 'status@broadcast') {
                 const compositeKey = `${fromJid}_${msg.key.id}`;
                 messageStore.set(compositeKey, {
@@ -449,22 +443,14 @@ async function startBot() {
                 }
             }
 
-            // 2. ANTI-DELETE LISTENER
+            // 2. ANTI-DELETE LISTENER (Strict exact chat + ID match)
             const activeAntiDelete = getConfig().ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
                 const originalRemoteJid = deletedKey.remoteJid || fromJid;
                 const lookupCompositeKey = `${originalRemoteJid}_${deletedKey.id}`;
 
-                let deletedMsg = messageStore.get(lookupCompositeKey);
-                if (!deletedMsg && deletedKey.id) {
-                    for (const [k, v] of messageStore.entries()) {
-                        if (k.endsWith(`_${deletedKey.id}`)) {
-                            deletedMsg = v;
-                            break;
-                        }
-                    }
-                }
+                const deletedMsg = messageStore.get(lookupCompositeKey);
 
                 if (deletedMsg) {
                     try {
