@@ -65,7 +65,6 @@ function getConfig() {
             const savedData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
             return { ...defaultConfig, ...savedData };
         } catch (e) {
-            console.error('[CONFIG ERROR] Failed to parse config.json, falling back to defaults:', e.message);
             return defaultConfig;
         }
     } else {
@@ -81,9 +80,7 @@ function updateConfig(newSettings) {
     const updated = { ...current, ...newSettings };
     try {
         fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
-    } catch (e) {
-        console.error('[CONFIG ERROR] Failed to write config.json:', e.message);
-    }
+    } catch (e) {}
     return updated;
 }
 
@@ -109,7 +106,7 @@ function markStatusAsViewedOnDisk(id) {
     } catch (e) {}
 }
 
-const messageStore = new Map();
+const messageStore = new Map(); // Indexed strictly by message ID for robust JID-agnostic lookup
 const recentStatusStore = new Map();
 const startTime = Date.now();
 let activeSock = null;
@@ -143,7 +140,6 @@ async function processStatusQueue(sock) {
     isProcessingQueue = true;
 
     let processedCount = 0;
-    let failedCount = 0;
 
     try {
         while (statusQueue.length > 0) {
@@ -154,10 +150,7 @@ async function processStatusQueue(sock) {
             }
 
             const currentSock = activeSock || sock;
-            if (!currentSock) {
-                console.warn('[STATUS QUEUE] Paused: No active socket connection available.');
-                break;
-            }
+            if (!currentSock) break;
 
             const item = statusQueue.shift();
             if (!item || !item.msg || !item.msg.key) continue;
@@ -190,10 +183,7 @@ async function processStatusQueue(sock) {
                 }
 
                 receiptConfirmed = true;
-            } catch (err) {
-                console.error(`[STATUS RECEIPT FAILED] ID: ${statusId} From: ${participant} Reason: ${err.message}`);
-                failedCount++;
-            }
+            } catch (err) {}
 
             if (receiptConfirmed) {
                 markStatusAsViewedOnDisk(statusId);
@@ -288,16 +278,15 @@ async function startBot() {
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000,
         getMessage: async (key) => {
-            if (key.id && key.remoteJid) {
-                const compositeKey = `${key.remoteJid}_${key.id}`;
-                if (messageStore.has(compositeKey)) {
-                    return messageStore.get(compositeKey).message;
+            if (key.id) {
+                // Direct ID lookup resolves @lid vs @s.whatsapp.net mismatches
+                if (messageStore.has(key.id)) {
+                    return messageStore.get(key.id).message;
+                }
+                if (recentStatusStore.has(key.id)) {
+                    return recentStatusStore.get(key.id).message;
                 }
             }
-            if (key.id && recentStatusStore.has(key.id)) {
-                return recentStatusStore.get(key.id).message;
-            }
-            console.warn(`[GET_MESSAGE CACHE MISS] ID: ${key.id} RemoteJid: ${key.remoteJid || 'unknown'}`);
             return null;
         }
     });
@@ -314,9 +303,7 @@ async function startBot() {
                 console.log(`2. Tap Settings -> Linked Devices -> Link a Device.`);
                 console.log(`3. Tap 'Link with phone number instead' & enter the code above.`);
                 console.log(`============================================\n`);
-            } catch (err) {
-                console.error('Failed to request pairing code:', err.message);
-            }
+            } catch (err) {}
         }, 3000);
     }
 
@@ -385,9 +372,7 @@ async function startBot() {
 
                             await sock.sendMessage(sudoJid, { text: notifyText });
                         }
-                    } catch (e) {
-                        console.error('[STARTUP NOTIFICATION ERROR]:', e.message);
-                    }
+                    } catch (e) {}
                 }, 3000);
             }
         }
@@ -428,37 +413,32 @@ async function startBot() {
                 continue;
             }
 
-            // Cache incoming chat messages with strict composite key
+            // Cache incoming chat messages indexed strictly by ID
             if (msg.key.id && fromJid !== 'status@broadcast') {
-                const compositeKey = `${fromJid}_${msg.key.id}`;
-                messageStore.set(compositeKey, {
+                messageStore.set(msg.key.id, {
                     key: msg.key,
                     message: msg.message,
-                    participant: msg.key.participant || fromJid
+                    participant: msg.key.participant || fromJid,
+                    remoteJid: fromJid
                 });
 
-                if (messageStore.size > 500) {
+                if (messageStore.size > 800) {
                     const firstKey = messageStore.keys().next().value;
                     messageStore.delete(firstKey);
                 }
             }
 
-            // 2. ANTI-DELETE LISTENER (Strict exact chat + ID match)
+            // 2. ANTI-DELETE LISTENER (ID-based lookup)
             const activeAntiDelete = getConfig().ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
-                const originalRemoteJid = deletedKey.remoteJid || fromJid;
-                const lookupCompositeKey = `${originalRemoteJid}_${deletedKey.id}`;
-
-                const deletedMsg = messageStore.get(lookupCompositeKey);
+                const deletedMsg = messageStore.get(deletedKey.id);
 
                 if (deletedMsg) {
                     try {
+                        const originalRemoteJid = deletedMsg.key.remoteJid || fromJid;
                         const targetChat = activeAntiDelete === 'g' ? originalRemoteJid : sudoJid;
-                        if (!targetChat) {
-                            console.error('[ANTI-DELETE ERROR] Target chat destination could not be resolved.');
-                            continue;
-                        }
+                        if (!targetChat) continue;
 
                         const senderJid = deletedMsg.participant || deletedKey.participant || originalRemoteJid;
                         const sender = senderJid.split('@')[0];
@@ -472,10 +452,7 @@ async function startBot() {
                                 'buffer',
                                 {},
                                 { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-                            ).catch((err) => {
-                                console.error('[ANTI-DELETE MEDIA DOWNLOAD FAILED]:', err.message);
-                                return null;
-                            });
+                            ).catch(() => null);
 
                             if (mediaBuffer) {
                                 const mediaPayload = { caption: `${header}*Deleted Media*`, mentions: [senderJid] };
@@ -486,20 +463,14 @@ async function startBot() {
                                 else mediaPayload.document = mediaBuffer;
 
                                 await sock.sendMessage(targetChat, mediaPayload);
-                                console.log(`[ANTI-DELETE TRIGGERED] Successfully recovered & sent media from ${sender}`);
                             } else {
                                 await sock.sendMessage(targetChat, { text: `${header}⚠️ *Media recovery failed:* Original media buffer could not be downloaded.`, mentions: [senderJid] });
                             }
                         } else {
                             const deletedText = deletedMsg.message?.conversation || deletedMsg.message?.extendedTextMessage?.text || 'Message content unavailable';
                             await sock.sendMessage(targetChat, { text: `${header}*Deleted Message:* ${deletedText}`, mentions: [senderJid] });
-                            console.log(`[ANTI-DELETE TRIGGERED] Successfully recovered text from ${sender}`);
                         }
-                    } catch (err) {
-                        console.error('[ANTI-DELETE ERROR] Execution failed:', err.message);
-                    }
-                } else {
-                    console.log(`[ANTI-DELETE] Cache miss for deleted message ID: ${deletedKey.id} in chat ${originalRemoteJid}`);
+                    } catch (err) {}
                 }
             }
 
@@ -544,10 +515,7 @@ async function startBot() {
                                 key: targetKey
                             }
                         });
-                        console.log(`[.react COMMAND] Reacted with ${reactionEmoji}`);
-                    } catch (err) {
-                        console.error('.react command error:', err.message);
-                    }
+                    } catch (err) {}
                 } else {
                     await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a message with `.react <emoji>`' }, { quoted: msg });
                 }
@@ -578,12 +546,10 @@ async function startBot() {
 
                             const stickerBuffer = await sticker.toBuffer();
                             await sock.sendMessage(fromJid, { sticker: stickerBuffer }, { quoted: msg });
-                            console.log(`[.sticker COMMAND] Sticker created successfully`);
                         } else {
                             await sock.sendMessage(fromJid, { text: '⚠️ Failed to download media for sticker conversion.' }, { quoted: msg });
                         }
                     } catch (err) {
-                        console.error('.sticker command error:', err.message);
                         await sock.sendMessage(fromJid, { text: '⚠️ Error generating sticker.' }, { quoted: msg });
                     }
                 } else {
@@ -684,12 +650,10 @@ async function startBot() {
 
                             await sock.sendMessage(sudoJid, payload);
                             await sock.sendMessage(fromJid, { delete: msg.key }).catch(() => null);
-                            console.log(`[.vv COMMAND] View-Once media unlocked silently to SUDO DM`);
                         } else {
                             await sock.sendMessage(fromJid, { text: '⚠️ Failed to download View-Once media.' }, { quoted: msg });
                         }
                     } catch (err) {
-                        console.error('.vv command error:', err.message);
                         await sock.sendMessage(fromJid, { text: '⚠️ Error unlocking View-Once media.' }, { quoted: msg });
                     }
                 } else {
@@ -724,7 +688,6 @@ async function startBot() {
 
                             await sock.sendMessage(sudoJid, payload);
                             await sock.sendMessage(fromJid, { react: { text: '✅', key: msg.key } }).catch(() => null);
-                            console.log(`[.save COMMAND] Content saved silently to SUDO DM`);
                         } else {
                             await sock.sendMessage(fromJid, { text: '⚠️ Failed to download media for saving.' }, { quoted: msg });
                         }
@@ -733,11 +696,9 @@ async function startBot() {
                         if (sudoJid) {
                             await sock.sendMessage(sudoJid, { text: `💾 *Saved Text:* ${saveText}` });
                             await sock.sendMessage(fromJid, { react: { text: '✅', key: msg.key } }).catch(() => null);
-                            console.log(`[.save COMMAND] Text saved silently to SUDO DM`);
                         }
                     }
                 } catch (err) {
-                    console.error('.save command error:', err.message);
                     await sock.sendMessage(fromJid, { text: '⚠️ Error saving content.' }, { quoted: msg });
                 }
             }
