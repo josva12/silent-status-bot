@@ -1,11 +1,11 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, getContentType, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const qrcodeTerminal = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// Filter Baileys Noise & Key Ratchet Warning Logs
+// Universal Noise Filter for PM2 Logs
 const isNoise = (args) => {
     const str = args.map(a => {
         if (typeof a === 'object') {
@@ -47,14 +47,16 @@ const rl = readline.createInterface({
 });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-// CONFIGURATION & DISK PERSISTENCE
+// =========================================================
+// HARDENED CONFIGURATION MANAGER (Disk Backed)
+// =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
 
 function getConfig() {
     let defaultConfig = {
-        AUTO_STATUS_VIEW: 'no-dl',
-        ANTI_DELETE: 'p',
+        AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
+        ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
         NOTIFIED_STARTUP: false
     };
 
@@ -63,6 +65,7 @@ function getConfig() {
             const savedData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
             return { ...defaultConfig, ...savedData };
         } catch (e) {
+            console.error('[CONFIG ERROR] Failed to parse config.json, falling back to defaults:', e.message);
             return defaultConfig;
         }
     } else {
@@ -79,7 +82,7 @@ function updateConfig(newSettings) {
     try {
         fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
     } catch (e) {
-        console.error('Failed to write config.json:', e);
+        console.error('[CONFIG ERROR] Failed to write config.json:', e.message);
     }
     return updated;
 }
@@ -123,7 +126,9 @@ function trackStatusKey(msg) {
     }
 }
 
-// STATUS PROCESSING QUEUE
+// =========================================================
+// PACED STATUS QUEUE (AppState Sync & Guard)
+// =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
 
@@ -137,11 +142,20 @@ async function processStatusQueue(sock) {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
 
+    let processedCount = 0;
+    let failedCount = 0;
+
     try {
         while (statusQueue.length > 0) {
             const currentCfg = getConfig();
             if (currentCfg.AUTO_STATUS_VIEW === 'off') {
                 statusQueue.length = 0;
+                break;
+            }
+
+            const currentSock = activeSock || sock;
+            if (!currentSock) {
+                console.warn('[STATUS QUEUE] Paused: No active socket connection available.');
                 break;
             }
 
@@ -152,7 +166,6 @@ async function processStatusQueue(sock) {
             const participant = item.msg.key.participant || item.msg.participant || item.msg.key.remoteJid;
 
             if (!item.force && viewedStatusSet.has(statusId)) continue;
-            if (!participant || participant === 'status@broadcast') continue;
 
             const cleanKey = {
                 remoteJid: 'status@broadcast',
@@ -161,29 +174,42 @@ async function processStatusQueue(sock) {
                 fromMe: false
             };
 
+            let receiptConfirmed = false;
+
             try {
-                if (sock.readMessages) {
-                    await sock.readMessages([cleanKey]);
+                await currentSock.readMessages([cleanKey]);
+
+                if (currentSock.sendReceipt) {
+                    await currentSock.sendReceipt('status@broadcast', participant, [statusId], 'read');
                 }
 
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+                await new Promise(res => setTimeout(res, 300));
+
+                if (currentSock.sendReceipt) {
+                    await currentSock.sendReceipt('status@broadcast', participant, [statusId], 'read-self');
                 }
 
-                markStatusAsViewedOnDisk(statusId);
-                console.log(`[STATUS MOVED TO VIEWED] ID: ${statusId} From: ${participant}`);
+                receiptConfirmed = true;
             } catch (err) {
-                if (!viewedStatusSet.has(statusId)) {
-                    setTimeout(() => {
-                        statusQueue.push(item);
-                        if (activeSock) processStatusQueue(activeSock);
-                    }, 3000);
-                }
+                console.error(`[STATUS RECEIPT FAILED] ID: ${statusId} From: ${participant} Reason: ${err.message}`);
+                failedCount++;
             }
 
-            const randomDelay = Math.floor(Math.random() * 250) + 200;
-            await new Promise(res => setTimeout(res, randomDelay));
+            if (receiptConfirmed) {
+                markStatusAsViewedOnDisk(statusId);
+                processedCount++;
+                console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
+            }
+
+            await new Promise(res => setTimeout(res, 1200));
+        }
+
+        const finalSock = activeSock || sock;
+        if (processedCount > 0 && finalSock && finalSock.chatModify) {
+            await finalSock.chatModify(
+                { markRead: true },
+                'status@broadcast'
+            ).catch(() => null);
         }
     } finally {
         isProcessingQueue = false;
@@ -201,7 +227,9 @@ async function sweepAndReadStatuses(sock) {
             count++;
         }
     }
-    if (count > 0) processStatusQueue(sock);
+    if (count > 0) {
+        processStatusQueue(sock);
+    }
     return count;
 }
 
@@ -215,7 +243,9 @@ async function forceSweepAndReadStatuses(sock) {
         statusQueue.push({ msg, force: true });
         count++;
     }
-    if (count > 0) processStatusQueue(sock);
+    if (count > 0) {
+        processStatusQueue(sock);
+    }
     return count;
 }
 
@@ -223,7 +253,7 @@ async function startBot() {
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
+    
     let usePairingCode = false;
     let userPhoneNumber = '';
     const isInteractive = process.stdin.isTTY;
@@ -245,6 +275,8 @@ async function startBot() {
             } else {
                 console.log('\n⌛ Waiting for QR Code generation...');
             }
+        } else {
+            console.log('\n⚠️ No session credentials found in auth_info! Run "npm start" in terminal once to link your account.');
         }
     }
 
@@ -252,18 +284,25 @@ async function startBot() {
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 25000,
+        keepAliveIntervalMs: 30000,
         connectTimeoutMs: 60000,
-        retryRequestDelayMs: 500,
-        maxMsgRetryCount: 5,
-        markOnlineOnConnect: false,
-        syncFullHistory: false,
+        retryRequestDelayMs: 2000,
         getMessage: async (key) => {
-            if (key.id && messageStore.has(key.id)) {
-                return messageStore.get(key.id).message;
+            if (key.id && key.remoteJid) {
+                const compositeKey = `${key.remoteJid}_${key.id}`;
+                if (messageStore.has(compositeKey)) {
+                    return messageStore.get(compositeKey).message;
+                }
             }
-            if (key.id && recentStatusStore.has(key.id)) {
-                return recentStatusStore.get(key.id).message;
+            if (key.id) {
+                for (const [k, v] of messageStore.entries()) {
+                    if (k.endsWith(`_${key.id}`)) {
+                        return v.message;
+                    }
+                }
+                if (recentStatusStore.has(key.id)) {
+                    return recentStatusStore.get(key.id).message;
+                }
             }
             return { conversation: '' };
         }
@@ -275,10 +314,14 @@ async function startBot() {
                 const code = await sock.requestPairingCode(userPhoneNumber);
                 const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
                 console.log(`\n============================================`);
-                console.log(`🔑 YOUR WHATSAPP PAIRING CODE: ${formattedCode}`);
+                console.log(`🔑 YOUR WHATSAPP PAIRING CODE:`);
+                console.log(`\n       👉   ${formattedCode}   👈\n`);
+                console.log(`1. Open WhatsApp on your phone.`);
+                console.log(`2. Tap Settings -> Linked Devices -> Link a Device.`);
+                console.log(`3. Tap 'Link with phone number instead' & enter the code above.`);
                 console.log(`============================================\n`);
             } catch (err) {
-                console.error('Failed to request pairing code:', err);
+                console.error('Failed to request pairing code:', err.message);
             }
         }, 3000);
     }
@@ -320,6 +363,39 @@ async function startBot() {
             if (getConfig().AUTO_STATUS_VIEW !== 'off') {
                 sweepAndReadStatuses(sock);
             }
+
+            if (!getConfig().NOTIFIED_STARTUP) {
+                updateConfig({ NOTIFIED_STARTUP: true });
+
+                setTimeout(async () => {
+                    try {
+                        const currentCfg = getConfig();
+                        const sudoJid = sock.user ? jidNormalizedUser(sock.user.id) : null;
+                        if (sudoJid) {
+                            const notifyText = `🚀 *SILENT STATUS BOT IS ONLINE*\n` +
+                                               `_Designed by Josva_\n\n` +
+                                               `⚙️ *ACTIVE SETTINGS:*\n` +
+                                               `• Status View: *${currentCfg.AUTO_STATUS_VIEW}*\n` +
+                                               `• Anti-Delete: *${currentCfg.ANTI_DELETE}*\n\n` +
+                                               `💬 *IN-CHAT COMMANDS:*\n` +
+                                               `• *.alive* - Check bot uptime status\n` +
+                                               `• *.react <emoji>* | *.r* - Reply to any message to react with emoji\n` +
+                                               `• *.forceview* - Force re-view & resync all status updates\n` +
+                                               `• *.sticker* | *.s* - Reply to photo/video to make sticker\n` +
+                                               `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
+                                               `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
+                                               `• *.viewall* - Manually sweep & re-view status updates\n` +
+                                               `• *.vv* - Reply to View-Once media to unlock silently to DM\n` +
+                                               `• *.save* | *.wow🥰* - Reply to any message/media to save to DM\n` +
+                                               `• *.settings* - View live dashboard & RAM usage`;
+
+                            await sock.sendMessage(sudoJid, { text: notifyText });
+                        }
+                    } catch (e) {
+                        console.error('[STARTUP NOTIFICATION ERROR]:', e.message);
+                    }
+                }, 3000);
+            }
         }
     });
 
@@ -336,7 +412,7 @@ async function startBot() {
     }, 5 * 60 * 1000);
 
     sock.ev.on('messages.upsert', async (m) => {
-        const sudoJid = sock.user ? (sock.user.id.split(':')[0] + '@s.whatsapp.net') : null;
+        const sudoJid = sock.user ? jidNormalizedUser(sock.user.id) : null;
 
         for (const msg of m.messages) {
             if (!msg.message) continue;
@@ -344,21 +420,24 @@ async function startBot() {
             const fromJid = msg.key.remoteJid;
             const isGroup = fromJid.endsWith('@g.us');
             const type = getContentType(msg.message);
-            const isFromSudo = msg.key.fromMe || (msg.key.participant && sudoJid && msg.key.participant.includes(sudoJid.split('@')[0]));
+            const isFromSudo = msg.key.fromMe || (msg.key.participant && sudoJid && jidNormalizedUser(msg.key.participant) === sudoJid) || (fromJid && sudoJid && jidNormalizedUser(fromJid) === sudoJid);
 
-            // AUTO STATUS VIEWER
+            // 1. SILENT AUTO STATUS VIEWER
             if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
-                if (getConfig().AUTO_STATUS_VIEW !== 'off') {
+
+                const currentCfg = getConfig();
+                if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
                     statusQueue.push({ msg: msg, force: false });
                     processStatusQueue(sock);
                 }
                 continue;
             }
 
-            // CACHE MESSAGES
+            // Cache incoming chat messages with composite key for Anti-Delete
             if (msg.key.id && fromJid !== 'status@broadcast') {
-                messageStore.set(msg.key.id, {
+                const compositeKey = `${fromJid}_${msg.key.id}`;
+                messageStore.set(compositeKey, {
                     key: msg.key,
                     message: msg.message,
                     participant: msg.key.participant || fromJid
@@ -370,6 +449,74 @@ async function startBot() {
                 }
             }
 
+            // 2. ANTI-DELETE LISTENER
+            const activeAntiDelete = getConfig().ANTI_DELETE;
+            if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
+                const deletedKey = msg.message.protocolMessage.key;
+                const originalRemoteJid = deletedKey.remoteJid || fromJid;
+                const lookupCompositeKey = `${originalRemoteJid}_${deletedKey.id}`;
+
+                let deletedMsg = messageStore.get(lookupCompositeKey);
+                if (!deletedMsg && deletedKey.id) {
+                    for (const [k, v] of messageStore.entries()) {
+                        if (k.endsWith(`_${deletedKey.id}`)) {
+                            deletedMsg = v;
+                            break;
+                        }
+                    }
+                }
+
+                if (deletedMsg) {
+                    try {
+                        const targetChat = activeAntiDelete === 'g' ? originalRemoteJid : sudoJid;
+                        if (!targetChat) {
+                            console.error('[ANTI-DELETE ERROR] Target chat destination could not be resolved.');
+                            continue;
+                        }
+
+                        const senderJid = deletedMsg.participant || deletedKey.participant || originalRemoteJid;
+                        const sender = senderJid.split('@')[0];
+                        const header = `🗑️ *Anti-Delete Alert*\n👤 *Sender:* @${sender}\n💬 *Chat:* ${originalRemoteJid.endsWith('@g.us') ? 'Group' : 'Private'}\n\n`;
+
+                        const innerType = getContentType(deletedMsg.message);
+
+                        if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(innerType)) {
+                            const mediaBuffer = await downloadMediaMessage(
+                                { key: deletedMsg.key, message: deletedMsg.message },
+                                'buffer',
+                                {},
+                                { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+                            ).catch((err) => {
+                                console.error('[ANTI-DELETE MEDIA DOWNLOAD FAILED]:', err.message);
+                                return null;
+                            });
+
+                            if (mediaBuffer) {
+                                const mediaPayload = { caption: `${header}*Deleted Media*`, mentions: [senderJid] };
+                                if (innerType === 'imageMessage') mediaPayload.image = mediaBuffer;
+                                else if (innerType === 'videoMessage') mediaPayload.video = mediaBuffer;
+                                else if (innerType === 'audioMessage') mediaPayload.audio = mediaBuffer;
+                                else if (innerType === 'stickerMessage') mediaPayload.sticker = mediaBuffer;
+                                else mediaPayload.document = mediaBuffer;
+
+                                await sock.sendMessage(targetChat, mediaPayload);
+                                console.log(`[ANTI-DELETE TRIGGERED] Successfully recovered & sent media from ${sender}`);
+                            } else {
+                                await sock.sendMessage(targetChat, { text: `${header}⚠️ *Media recovery failed:* Original media buffer could not be downloaded.`, mentions: [senderJid] });
+                            }
+                        } else {
+                            const deletedText = deletedMsg.message?.conversation || deletedMsg.message?.extendedTextMessage?.text || 'Message content unavailable';
+                            await sock.sendMessage(targetChat, { text: `${header}*Deleted Message:* ${deletedText}`, mentions: [senderJid] });
+                            console.log(`[ANTI-DELETE TRIGGERED] Successfully recovered text from ${sender}`);
+                        }
+                    } catch (err) {
+                        console.error('[ANTI-DELETE ERROR] Execution failed:', err.message);
+                    }
+                } else {
+                    console.log(`[ANTI-DELETE] Cache miss for deleted message ID: ${deletedKey.id} in chat ${originalRemoteJid}`);
+                }
+            }
+
             // COMMAND PARSER
             const textContent = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
             if (!textContent.startsWith('.')) continue;
@@ -378,7 +525,9 @@ async function startBot() {
             const command = args[0].toLowerCase();
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
 
+            // COMMAND: .alive / .ping
             if (['.alive', '.ping'].includes(command)) {
                 const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                 const hours = Math.floor(uptimeSec / 3600);
@@ -386,11 +535,123 @@ async function startBot() {
                 const seconds = uptimeSec % 60;
 
                 const aliveMsg = `I'm here and ready! 🚀\nUptime : ${hours} hours ${minutes} minutes ${seconds} seconds`;
-                await sock.sendMessage(fromJid, { text: aliveMsg });
+                await sock.sendMessage(fromJid, { text: aliveMsg }, { quoted: msg });
                 continue;
             }
 
+            // COMMAND: .react / .r
+            if (['.react', '.r', '.reaction'].includes(command)) {
+                const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
+
+                if (quotedInfo && quotedInfo.stanzaId) {
+                    try {
+                        const targetKey = {
+                            remoteJid: fromJid,
+                            id: quotedInfo.stanzaId,
+                            participant: quotedInfo.participant,
+                            fromMe: quotedInfo.participant === sudoJid
+                        };
+
+                        await sock.sendMessage(fromJid, {
+                            react: {
+                                text: reactionEmoji,
+                                key: targetKey
+                            }
+                        });
+                        console.log(`[.react COMMAND] Reacted with ${reactionEmoji}`);
+                    } catch (err) {
+                        console.error('.react command error:', err.message);
+                    }
+                } else {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a message with `.react <emoji>`' }, { quoted: msg });
+                }
+                continue;
+            }
+
+            // COMMAND: .sticker / .s
+            if (['.sticker', '.s', '.stk'].includes(command)) {
+                const mediaType = quotedMsg ? getContentType(quotedMsg) : type;
+
+                if (['imageMessage', 'videoMessage'].includes(mediaType)) {
+                    try {
+                        const targetMsgObj = quotedMsg ? {
+                            key: { remoteJid: fromJid, id: quotedInfo.stanzaId, participant: quotedInfo?.participant },
+                            message: quotedMsg
+                        } : msg;
+
+                        const mediaBuffer = await downloadMediaMessage(targetMsgObj, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+
+                        if (mediaBuffer) {
+                            const { Sticker, StickerTypes } = require('wa-sticker-formatter');
+                            const sticker = new Sticker(mediaBuffer, {
+                                pack: 'Silent Status Bot',
+                                author: 'Josva',
+                                type: StickerTypes.FULL,
+                                quality: 70
+                            });
+
+                            const stickerBuffer = await sticker.toBuffer();
+                            await sock.sendMessage(fromJid, { sticker: stickerBuffer }, { quoted: msg });
+                            console.log(`[.sticker COMMAND] Sticker created successfully`);
+                        } else {
+                            await sock.sendMessage(fromJid, { text: '⚠️ Failed to download media for sticker conversion.' }, { quoted: msg });
+                        }
+                    } catch (err) {
+                        console.error('.sticker command error:', err.message);
+                        await sock.sendMessage(fromJid, { text: '⚠️ Error generating sticker.' }, { quoted: msg });
+                    }
+                } else {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Please reply to an image or video to make a sticker.' }, { quoted: msg });
+                }
+                continue;
+            }
+
+            // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
+                if (['.forceview', '.resync', '.review'].includes(command)) {
+                    const count = await forceSweepAndReadStatuses(sock);
+                    await sock.sendMessage(fromJid, { text: `Done! Queued ${count} status updates for force review & resync. 🚀` }, { quoted: msg });
+                    continue;
+                }
+
+                if (command === '.viewall' || command === '.readstatus') {
+                    const count = await sweepAndReadStatuses(sock);
+                    await sock.sendMessage(fromJid, { text: `Done! Queued ${count} unread status updates for background viewing. ✅` }, { quoted: msg });
+                    continue;
+                }
+
+                if (command === '.status') {
+                    if (['no-dl', 'on', 'true'].includes(param)) {
+                        updateConfig({ AUTO_STATUS_VIEW: 'no-dl' });
+                        await sock.sendMessage(fromJid, { text: 'Done! Status View: [no-dl] ✅' }, { quoted: msg });
+                    } else if (['off', 'false'].includes(param)) {
+                        updateConfig({ AUTO_STATUS_VIEW: 'off' });
+                        statusQueue.length = 0;
+                        await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, { quoted: msg });
+                    } else {
+                        const currentCfg = getConfig();
+                        await sock.sendMessage(fromJid, { text: `Current Setting: Status View = [${currentCfg.AUTO_STATUS_VIEW}]\nUsage: .status no-dl | .status off` }, { quoted: msg });
+                    }
+                    continue;
+                }
+
+                if (command === '.delete') {
+                    if (param === 'p') {
+                        updateConfig({ ANTI_DELETE: 'p' });
+                        await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [p] (Send to SUDO DM) 🗑️' }, { quoted: msg });
+                    } else if (param === 'g') {
+                        updateConfig({ ANTI_DELETE: 'g' });
+                        await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [g] (Send to Same Group) 🗑️' }, { quoted: msg });
+                    } else if (['off', 'false'].includes(param)) {
+                        updateConfig({ ANTI_DELETE: 'off' });
+                        await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [off] 🛑' }, { quoted: msg });
+                    } else {
+                        const currentCfg = getConfig();
+                        await sock.sendMessage(fromJid, { text: `Current Setting: Anti-Delete = [${currentCfg.ANTI_DELETE}]\nUsage: .delete p | .delete g | .delete off` }, { quoted: msg });
+                    }
+                    continue;
+                }
+
                 if (['.menu', '.settings', '.vars', '.help'].includes(command)) {
                     const currentCfg = getConfig();
                     const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
@@ -404,11 +665,94 @@ async function startBot() {
                                      `🗑️ *ANTI DELETE MSG:* ${currentCfg.ANTI_DELETE !== 'off' ? '✅ (' + currentCfg.ANTI_DELETE + ')' : '❎ (off)'}\n` +
                                      `💾 *RAM USAGE:* ${ramUsage} MB\n` +
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
-                                     `*Commands:* .alive, .react, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
+                                     `*Commands:* .alive, .react, .forceview, .sticker, .viewall, .status, .delete, .vv, .save, .wow🥰`.trim();
 
-                    // Send directly without quoting to prevent self-message signal ratchet drops
-                    await sock.sendMessage(fromJid, { text: menuText });
+                    await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
                     continue;
+                }
+            }
+
+            // USER COMMANDS (.vv and .save)
+            if (command === '.vv') {
+                if (!quotedMsg) {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a View-Once media message with `.vv`' }, { quoted: msg });
+                    continue;
+                }
+
+                const voObj = quotedMsg.viewOnceMessage?.message || quotedMsg.viewOnceMessageV2?.message || quotedMsg.viewOnceMessageV2Extension?.message || quotedMsg;
+                const voType = getContentType(voObj);
+
+                if (['imageMessage', 'videoMessage', 'audioMessage'].includes(voType)) {
+                    try {
+                        const fakeMsg = {
+                            key: { remoteJid: fromJid, id: quotedInfo.stanzaId, participant: quotedInfo.participant },
+                            message: voObj
+                        };
+                        const buffer = await downloadMediaMessage(fakeMsg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+
+                        if (buffer && sudoJid) {
+                            const payload = {};
+                            if (voType === 'imageMessage') payload.image = buffer;
+                            else if (voType === 'videoMessage') payload.video = buffer;
+                            else if (voType === 'audioMessage') payload.audio = buffer;
+
+                            await sock.sendMessage(sudoJid, payload);
+                            await sock.sendMessage(fromJid, { delete: msg.key }).catch(() => null);
+                            console.log(`[.vv COMMAND] View-Once media unlocked silently to SUDO DM`);
+                        } else {
+                            await sock.sendMessage(fromJid, { text: '⚠️ Failed to download View-Once media.' }, { quoted: msg });
+                        }
+                    } catch (err) {
+                        console.error('.vv command error:', err.message);
+                        await sock.sendMessage(fromJid, { text: '⚠️ Error unlocking View-Once media.' }, { quoted: msg });
+                    }
+                } else {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Quoted message is not a valid View-Once media type.' }, { quoted: msg });
+                }
+                continue;
+            }
+
+            if (['.save', '.wow🥰'].includes(command)) {
+                if (!quotedMsg) {
+                    await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a message or media with `.save`' }, { quoted: msg });
+                    continue;
+                }
+
+                try {
+                    const saveType = getContentType(quotedMsg);
+
+                    if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(saveType)) {
+                        const fakeMsg = {
+                            key: { remoteJid: fromJid, id: quotedInfo.stanzaId, participant: quotedInfo.participant },
+                            message: quotedMsg
+                        };
+                        const buffer = await downloadMediaMessage(fakeMsg, 'buffer', {}, { logger: pino({ level: 'silent' }) }).catch(() => null);
+
+                        if (buffer && sudoJid) {
+                            const payload = {};
+                            if (saveType === 'imageMessage') payload.image = buffer;
+                            else if (saveType === 'videoMessage') payload.video = buffer;
+                            else if (saveType === 'audioMessage') payload.audio = buffer;
+                            else if (saveType === 'stickerMessage') payload.sticker = buffer;
+                            else payload.document = buffer;
+
+                            await sock.sendMessage(sudoJid, payload);
+                            await sock.sendMessage(fromJid, { react: { text: '✅', key: msg.key } }).catch(() => null);
+                            console.log(`[.save COMMAND] Content saved silently to SUDO DM`);
+                        } else {
+                            await sock.sendMessage(fromJid, { text: '⚠️ Failed to download media for saving.' }, { quoted: msg });
+                        }
+                    } else {
+                        const saveText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || 'Text message';
+                        if (sudoJid) {
+                            await sock.sendMessage(sudoJid, { text: `💾 *Saved Text:* ${saveText}` });
+                            await sock.sendMessage(fromJid, { react: { text: '✅', key: msg.key } }).catch(() => null);
+                            console.log(`[.save COMMAND] Text saved silently to SUDO DM`);
+                        }
+                    }
+                } catch (err) {
+                    console.error('.save command error:', err.message);
+                    await sock.sendMessage(fromJid, { text: '⚠️ Error saving content.' }, { quoted: msg });
                 }
             }
         }
