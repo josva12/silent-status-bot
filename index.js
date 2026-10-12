@@ -5,7 +5,7 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// Universal Noise Filter for PM2 Logs
+// Universal Noise Filter
 const isNoise = (args) => {
     const str = args.map(a => {
         if (typeof a === 'object') {
@@ -47,16 +47,13 @@ const rl = readline.createInterface({
 });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-// =========================================================
-// HARDENED CONFIGURATION MANAGER (Disk Backed)
-// =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
 
 function getConfig() {
     let defaultConfig = {
-        AUTO_STATUS_VIEW: 'no-dl', // 'no-dl' or 'off'
-        ANTI_DELETE: 'p',          // 'p', 'g', or 'off'
+        AUTO_STATUS_VIEW: 'no-dl',
+        ANTI_DELETE: 'p',
         NOTIFIED_STARTUP: false
     };
 
@@ -106,11 +103,13 @@ function markStatusAsViewedOnDisk(id) {
     } catch (e) {}
 }
 
-const messageStore = new Map(); // Indexed strictly by message ID for robust JID-agnostic lookup
+const messageStore = new Map();
 const recentStatusStore = new Map();
 const startTime = Date.now();
+
+// SINGLETON SOCKET MANAGEMENT
 let activeSock = null;
-let initialActiveLogged = false;
+let isReconnecting = false;
 let sweeperInterval = null;
 
 function trackStatusKey(msg) {
@@ -123,9 +122,6 @@ function trackStatusKey(msg) {
     }
 }
 
-// =========================================================
-// PACED STATUS QUEUE (AppState Sync & Guard)
-// =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
 
@@ -240,6 +236,15 @@ async function forceSweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
+    // Destroy previous socket instance before spinning up a new one
+    if (activeSock) {
+        try {
+            activeSock.ev.removeAllListeners();
+            if (activeSock.ws) activeSock.ws.close();
+        } catch (e) {}
+        activeSock = null;
+    }
+
     const credsPath = path.join(__dirname, 'auth_info', 'creds.json');
     const isRegisteredOnDisk = fs.existsSync(credsPath);
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -279,7 +284,6 @@ async function startBot() {
         retryRequestDelayMs: 2000,
         getMessage: async (key) => {
             if (key.id) {
-                // Direct ID lookup resolves @lid vs @s.whatsapp.net mismatches
                 if (messageStore.has(key.id)) {
                     return messageStore.get(key.id).message;
                 }
@@ -290,6 +294,8 @@ async function startBot() {
             return null;
         }
     });
+
+    activeSock = sock;
 
     if (usePairingCode && !sock.authState.creds.registered) {
         setTimeout(async () => {
@@ -320,26 +326,26 @@ async function startBot() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-            if (activeSock) {
-                try {
-                    activeSock.ev.removeAllListeners();
-                    if (activeSock.ws) activeSock.ws.close();
-                } catch (e) {}
-                activeSock = null;
-            }
+            try {
+                sock.ev.removeAllListeners();
+                if (sock.ws) sock.ws.close();
+            } catch (e) {}
+            activeSock = null;
 
             if (!isLoggedOut) {
-                setTimeout(() => startBot(), 2000);
+                if (!isReconnecting) {
+                    isReconnecting = true;
+                    setTimeout(() => {
+                        isReconnecting = false;
+                        startBot();
+                    }, 3000);
+                }
             } else {
                 console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
             }
         } else if (connection === 'open') {
-            activeSock = sock;
-
-            if (!initialActiveLogged) {
-                initialActiveLogged = true;
-                console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
-            }
+            isReconnecting = false;
+            console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
 
             if (getConfig().AUTO_STATUS_VIEW !== 'off') {
                 sweepAndReadStatuses(sock);
@@ -397,7 +403,6 @@ async function startBot() {
             if (!msg.message) continue;
 
             const fromJid = msg.key.remoteJid;
-            const isGroup = fromJid.endsWith('@g.us');
             const type = getContentType(msg.message);
             const isFromSudo = msg.key.fromMe || (msg.key.participant && sudoJid && jidNormalizedUser(msg.key.participant) === sudoJid) || (fromJid && sudoJid && jidNormalizedUser(fromJid) === sudoJid);
 
@@ -428,7 +433,7 @@ async function startBot() {
                 }
             }
 
-            // 2. ANTI-DELETE LISTENER (ID-based lookup)
+            // 2. ANTI-DELETE LISTENER
             const activeAntiDelete = getConfig().ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
