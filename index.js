@@ -5,7 +5,7 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// Universal Noise Filter
+// Universal Noise Filter (Suppresses historical decryption backlog warnings)
 const isNoise = (args) => {
     const str = args.map(a => {
         if (typeof a === 'object') {
@@ -25,7 +25,9 @@ const isNoise = (args) => {
         str.includes('Session error') ||
         str.includes('registrationId') ||
         str.includes('_chains') ||
-        str.includes('currentRatchet')
+        str.includes('currentRatchet') ||
+        str.includes('Decrypted message with closed session') ||
+        str.includes('Waiting for this message')
     );
 };
 
@@ -106,10 +108,7 @@ function markStatusAsViewedOnDisk(id) {
 const messageStore = new Map();
 const recentStatusStore = new Map();
 const startTime = Date.now();
-
-// SINGLETON SOCKET MANAGEMENT
 let activeSock = null;
-let isReconnecting = false;
 let sweeperInterval = null;
 
 function trackStatusKey(msg) {
@@ -236,7 +235,6 @@ async function forceSweepAndReadStatuses(sock) {
 }
 
 async function startBot() {
-    // Destroy previous socket instance before spinning up a new one
     if (activeSock) {
         try {
             activeSock.ev.removeAllListeners();
@@ -270,8 +268,6 @@ async function startBot() {
             } else {
                 console.log('\n⌛ Waiting for QR Code generation...');
             }
-        } else {
-            console.log('\n⚠️ No session credentials found in auth_info! Run "npm start" in terminal once to link your account.');
         }
     }
 
@@ -315,6 +311,7 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    let isReconnecting = false;
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -340,8 +337,6 @@ async function startBot() {
                         startBot();
                     }, 3000);
                 }
-            } else {
-                console.log('⚠️ Session logged out. Run "npm start" to re-link account.');
             }
         } else if (connection === 'open') {
             isReconnecting = false;
