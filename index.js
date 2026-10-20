@@ -13,9 +13,7 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// =========================================================
-// UNIVERSAL NOISE & CRYPTO ERROR INTERCEPTOR
-// =========================================================
+// Universal Noise Filter for PM2 Logs
 const isNoise = (args) => {
     const str = args.map(a => {
         if (typeof a === 'object') {
@@ -53,7 +51,7 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION
+// PERSISTENT CONFIGURATION (Saved in config.json)
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
@@ -113,7 +111,6 @@ function markStatusAsViewedOnDisk(id) {
     } catch (e) {}
 }
 
-// Bounded message stores to solve "Waiting for this message" & anti-delete
 const messageStore = new Map();
 const recentStatusStore = new Map();
 const startTime = Date.now();
@@ -121,7 +118,6 @@ let activeSock = null;
 let initialActiveLogged = false;
 let sweeperInterval = null;
 
-// Helper: Recursively unwrap nested message envelopes
 function unwrapMessage(msg) {
     if (!msg) return null;
     let m = msg;
@@ -143,18 +139,6 @@ function trackStatusKey(msg) {
     }
 }
 
-function extractParticipantJids(msg) {
-    const jids = new Set();
-    if (msg && msg.key) {
-        if (msg.key.participant) jids.add(msg.key.participant);
-        if (msg.key.participantAlt) jids.add(msg.key.participantAlt);
-        if (msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') jids.add(msg.key.remoteJid);
-    }
-    if (msg && msg.participant) jids.add(msg.participant);
-    return Array.from(jids).filter(Boolean);
-}
-
-// Helper: Cache sent message so phone retry requests immediately decrypt
 function cacheOutgoingMessage(sentMsg) {
     if (sentMsg?.key?.id && sentMsg?.message) {
         messageStore.set(sentMsg.key.id, {
@@ -168,7 +152,7 @@ function cacheOutgoingMessage(sentMsg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE
+// PACED STATUS QUEUE (Direct msg.key + Dual Receipt Delivery)
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -195,34 +179,32 @@ async function processStatusQueue(sock) {
             if (!item || !item.msg || !item.msg.key) continue;
 
             const statusId = item.msg.key.id;
+            const participant = item.msg.key.participant || item.msg.participant;
+
             if (!item.force && viewedStatusSet.has(statusId)) continue;
+            if (!participant || participant === 'status@broadcast') continue;
 
-            const participantJids = extractParticipantJids(item.msg);
-            if (participantJids.length === 0) participantJids.push(item.msg.key.remoteJid);
+            try {
+                // 1. Pass the original untouched msg.key to trigger native Baileys handling
+                await sock.readMessages([item.msg.key]);
 
-            for (const pJid of participantJids) {
-                const cleanKey = {
-                    remoteJid: 'status@broadcast',
-                    id: statusId,
-                    participant: pJid,
-                    fromMe: false
-                };
+                // 2. Deliver contact read receipt
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
+                    
+                    // 3. Spaced delay before sending multi-device read-self stanza
+                    await new Promise(res => setTimeout(res, 200));
+                    
+                    // 4. Deliver read-self stanza to trigger phone UI sync
+                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+                }
 
-                try {
-                    await sock.readMessages([cleanKey]);
+                markStatusAsViewedOnDisk(statusId);
+                console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
+            } catch (err) {}
 
-                    if (sock.sendReceipt) {
-                        await sock.sendReceipt('status@broadcast', pJid, [statusId], 'read').catch(() => null);
-                        await new Promise(res => setTimeout(res, 200));
-                        await sock.sendReceipt('status@broadcast', pJid, [statusId], 'read-self').catch(() => null);
-                    }
-                } catch (err) {}
-            }
-
-            markStatusAsViewedOnDisk(statusId);
-            console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participantJids[0]}`);
-
-            await new Promise(res => setTimeout(res, 600));
+            // 250ms spacing prevents socket burst drops while remaining responsive
+            await new Promise(res => setTimeout(res, 250));
         }
     } finally {
         isProcessingQueue = false;
@@ -300,11 +282,10 @@ async function startBot() {
         auth: state,
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 25000,
+        keepAliveIntervalMs: 30000,
         connectTimeoutMs: 60000,
         retryRequestDelayMs: 2000,
         markOnlineOnConnect: false,
-        // SOLVES "Waiting for this message": Supplies WhatsApp with cached messages across multi-device companion syncs
         getMessage: async (key) => {
             if (key?.id) {
                 if (messageStore.has(key.id)) {
@@ -368,10 +349,6 @@ async function startBot() {
             if (!initialActiveLogged) {
                 initialActiveLogged = true;
                 console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
-            }
-
-            if (sock.resyncAppState) {
-                await sock.resyncAppState(['regular', 'regular_high']).catch(() => null);
             }
 
             if (getConfig().AUTO_STATUS_VIEW !== 'off') {
@@ -438,13 +415,12 @@ async function startBot() {
             const isGroup = fromJid.endsWith('@g.us');
             const type = getContentType(msg.message);
 
-            // Multi-Device SUDO Identification (matches phone, web, desktop, and companion instances)
             const senderJid = msg.key.participant ? jidNormalizedUser(msg.key.participant) : jidNormalizedUser(fromJid);
             const isFromSudo = msg.key.fromMe || 
                                (botUserJid && areJidsSameUser(senderJid, botUserJid)) || 
                                (botLid && areJidsSameUser(senderJid, botLid));
 
-            // 1. AUTO STATUS VIEWER
+            // 1. AUTO STATUS VIEWER (Pushing raw untouched msg directly)
             if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
 
@@ -456,7 +432,7 @@ async function startBot() {
                 continue;
             }
 
-            // 2. CACHE ALL CHAT MESSAGES (Solves "Waiting for this message" & Powers Anti-Delete)
+            // 2. CACHE ALL CHAT MESSAGES
             if (msg.key.id && fromJid !== 'status@broadcast') {
                 messageStore.set(msg.key.id, {
                     key: msg.key,
@@ -725,7 +701,7 @@ async function startBot() {
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
-                            // SENDS TO SUDO DM ONLY (Never back to originating chat)
+                            // SENDS TO SUDO DM ONLY
                             const res = await sock.sendMessage(botUserJid, payload);
                             if (res?.key?.id) {
                                 cacheOutgoingMessage(res);
