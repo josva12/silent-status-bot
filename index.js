@@ -113,7 +113,6 @@ function markStatusAsViewedOnDisk(id) {
     } catch (e) {}
 }
 
-// Bounded message stores to solve "Waiting for this message" & anti-delete
 const messageStore = new Map();
 const recentStatusStore = new Map();
 const startTime = Date.now();
@@ -143,7 +142,6 @@ function trackStatusKey(msg) {
     }
 }
 
-// Extract both Phone Number and LID identifiers for complete multi-device delivery
 function extractParticipantJids(msg) {
     const jids = new Set();
     if (msg && msg.key) {
@@ -156,7 +154,7 @@ function extractParticipantJids(msg) {
 }
 
 // =========================================================
-// PACED STATUS QUEUE (AppState Sync & Anti-Collision)
+// PACED STATUS QUEUE
 // =========================================================
 const statusQueue = [];
 let isProcessingQueue = false;
@@ -358,7 +356,6 @@ async function startBot() {
                 console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
             }
 
-            // Resync AppState Encryption Keys on Connection to keep companion synced
             if (sock.resyncAppState) {
                 await sock.resyncAppState(['regular', 'regular_high']).catch(() => null);
             }
@@ -388,8 +385,8 @@ async function startBot() {
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
                                                `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
                                                `• *.viewall* - Manually sweep & re-view status updates\n` +
-                                               `• *.vv* - Reply to View-Once media to unlock silently\n` +
-                                               `• *.save* - Reply to any message/media to save to DM\n` +
+                                               `• *.vv* - Reply to View-Once media to unlock silently to SUDO DM\n` +
+                                               `• *.save* - Reply to any message/media to save to SUDO DM\n` +
                                                `• *.settings* - View live dashboard & RAM usage`;
 
                             await sock.sendMessage(sudoJid, { text: notifyText });
@@ -426,8 +423,7 @@ async function startBot() {
             const isGroup = fromJid.endsWith('@g.us');
             const type = getContentType(msg.message);
 
-            // Accurate Multi-Device SUDO Identification:
-            // Checks if message is from your phone, WhatsApp Web, desktop, or bot itself
+            // Multi-Device SUDO Identification (matches phone, web, desktop, and companion instances)
             const senderJid = msg.key.participant ? jidNormalizedUser(msg.key.participant) : jidNormalizedUser(fromJid);
             const isFromSudo = msg.key.fromMe || 
                                (botUserJid && areJidsSameUser(senderJid, botUserJid)) || 
@@ -445,7 +441,7 @@ async function startBot() {
                 continue;
             }
 
-            // 2. CACHE ALL CHAT MESSAGES (Supports Multi-Device Sync & Anti-Delete)
+            // 2. CACHE ALL CHAT MESSAGES (Solves "Waiting for this message" & Powers Anti-Delete)
             if (msg.key.id && fromJid !== 'status@broadcast') {
                 messageStore.set(msg.key.id, {
                     key: msg.key,
@@ -461,7 +457,7 @@ async function startBot() {
                 }
             }
 
-            // 3. ROBUST ANTI-DELETE PROTOCOL LISTENER
+            // 3. ANTI-DELETE PROTOCOL LISTENER
             const activeAntiDelete = getConfig().ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
@@ -531,7 +527,7 @@ async function startBot() {
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
-            // COMMAND: .alive / .ping (Available on Phone and Web)
+            // COMMAND: .alive / .ping
             if (['.alive', '.ping'].includes(command)) {
                 const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                 const hours = Math.floor(uptimeSec / 3600);
@@ -543,7 +539,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .react / .r (Works seamlessly across devices)
+            // COMMAND: .react / .r
             if (['.react', '.r', '.reaction'].includes(command)) {
                 const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
                 const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -571,7 +567,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .sticker / .s (Photo/Video to Sticker Maker)
+            // COMMAND: .sticker / .s
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
                 const unwrappedMedia = unwrapMessage(targetMedia);
@@ -604,7 +600,7 @@ async function startBot() {
                 continue;
             }
 
-            // DYNAMIC IN-CHAT COMMANDS (Recognized from Phone, WhatsApp Web, Desktop, & Bot DM)
+            // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
                 if (['.forceview', '.resync', '.review'].includes(command)) {
                     const count = await forceSweepAndReadStatuses(sock);
@@ -670,9 +666,11 @@ async function startBot() {
                 }
             }
 
-            // 5. VIEW-ONCE UNLOCKER (.vv) - Works on Voice Notes, Images, & Videos
+            // =========================================================
+            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO SUDO DM ONLY
+            // =========================================================
             if (command === '.vv') {
-                if (!quotedMsg) continue;
+                if (!quotedMsg || !botUserJid) continue;
 
                 const unwrappedVO = unwrapMessage(quotedMsg);
                 const voType = unwrappedVO ? getContentType(unwrappedVO) : null;
@@ -686,7 +684,12 @@ async function startBot() {
                         const buffer = await downloadMediaMessage(fakeMsg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
 
                         if (buffer) {
-                            const payload = {};
+                            const senderName = (msg.message.extendedTextMessage.contextInfo.participant || fromJid).split('@')[0];
+                            const payload = { 
+                                caption: `🔓 *Unlocked View-Once Media*\n👤 *From:* @${senderName}\n💬 *Origin:* ${isGroup ? 'Group' : 'Private'}`,
+                                mentions: [msg.message.extendedTextMessage.contextInfo.participant || fromJid]
+                            };
+                            
                             if (voType === 'imageMessage') payload.image = buffer;
                             else if (voType === 'videoMessage') payload.video = buffer;
                             else if (voType === 'audioMessage') {
@@ -695,16 +698,21 @@ async function startBot() {
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
-                            await sock.sendMessage(fromJid, payload, { quoted: msg });
-                            console.log(`[.vv COMMAND] View-Once media unlocked silently`);
+                            // SENDS TO SUDO DM ONLY (Never back to originating chat)
+                            const res = await sock.sendMessage(botUserJid, payload);
+                            if (res?.key?.id) {
+                                console.log(`[.vv COMMAND] View-Once unlocked to SUDO DM (ID: ${res.key.id})`);
+                            }
                         }
                     } catch (err) {}
                 } else {
-                    await sock.sendMessage(fromJid, { text: '⚠️ Quoted message is not a View-Once media.' }, { quoted: msg });
+                    await sock.sendMessage(botUserJid, { text: '⚠️ Quoted message is not a valid View-Once media.' });
                 }
             }
 
-            // 6. CONTENT SAVER (.save) - Delivers to your SUDO DM from anywhere
+            // =========================================================
+            // 5. CONTENT SAVER (.save) -> STRICTLY TO SUDO DM ONLY
+            // =========================================================
             if (command === '.save') {
                 if (!quotedMsg || !botUserJid) continue;
 
@@ -727,19 +735,25 @@ async function startBot() {
                                 payload.audio = buffer;
                                 payload.mimetype = unwrappedSave.audioMessage?.mimetype || 'audio/mp4';
                                 payload.ptt = !!unwrappedSave.audioMessage?.ptt;
-                            } else if (saveType === 'stickerMessage') payload.sticker = buffer;
-                            else {
+                            } else if (saveType === 'stickerMessage') {
+                                payload.sticker = buffer;
+                            } else {
                                 payload.document = buffer;
                                 payload.mimetype = unwrappedSave.documentMessage?.mimetype || 'application/octet-stream';
                             }
 
-                            await sock.sendMessage(botUserJid, payload);
-                            console.log(`[.save COMMAND] Content saved silently to SUDO DM`);
+                            // SENDS TO SUDO DM ONLY
+                            const res = await sock.sendMessage(botUserJid, payload);
+                            if (res?.key?.id) {
+                                console.log(`[.save COMMAND] Content saved silently to SUDO DM (ID: ${res.key.id})`);
+                            }
                         }
                     } else {
-                        const saveText = unwrappedSave?.conversation || unwrappedSave?.extendedTextMessage?.text || 'Text message';
-                        await sock.sendMessage(botUserJid, { text: saveText });
-                        console.log(`[.save COMMAND] Text saved silently to SUDO DM`);
+                        const saveText = unwrappedSave?.conversation || unwrappedSave?.extendedTextMessage?.text || 'Text content';
+                        const res = await sock.sendMessage(botUserJid, { text: saveText });
+                        if (res?.key?.id) {
+                            console.log(`[.save COMMAND] Text saved silently to SUDO DM (ID: ${res.key.id})`);
+                        }
                     }
                 } catch (err) {}
             }
