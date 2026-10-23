@@ -26,6 +26,7 @@ const isNoise = (args) => {
         str.includes('MessageCounterError') ||
         str.includes('Failed to decrypt') ||
         str.includes('SessionEntry') ||
+        errorIsSessionObject(args) ||
         str.includes('Closing session') ||
         str.includes('Closing open session') ||
         str.includes('Bad MAC') ||
@@ -35,6 +36,10 @@ const isNoise = (args) => {
         str.includes('currentRatchet')
     );
 };
+
+function errorIsSessionObject(args) {
+    return args.some(arg => arg && typeof arg === 'object' && (arg.registrationId || arg.currentRatchet || arg._chains));
+}
 
 ['log', 'error', 'info', 'warn'].forEach((method) => {
     const orig = console[method];
@@ -51,7 +56,7 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION (Saved in config.json)
+// PERSISTENT CONFIGURATION & VIEWED STATUS TRACKER
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
@@ -101,7 +106,7 @@ function markStatusAsViewedOnDisk(id) {
     if (!id) return;
     viewedStatusSet.add(id);
 
-    if (viewedStatusSet.size > 3000) {
+    if (viewedStatusSet.size > 5000) {
         const first = viewedStatusSet.values().next().value;
         viewedStatusSet.delete(first);
     }
@@ -133,7 +138,7 @@ function trackStatusKey(msg) {
     if (!msg || !msg.key || !msg.key.id) return;
     recentStatusStore.set(msg.key.id, msg);
 
-    if (recentStatusStore.size > 1000) {
+    if (recentStatusStore.size > 2000) {
         const firstKey = recentStatusStore.keys().next().value;
         recentStatusStore.delete(firstKey);
     }
@@ -151,63 +156,98 @@ function cacheOutgoingMessage(sentMsg) {
     }
 }
 
-// =========================================================
-// PACED STATUS QUEUE (Direct msg.key + Dual Receipt Delivery)
-// =========================================================
-const statusQueue = [];
-let isProcessingQueue = false;
+function extractParticipantJids(msg) {
+    const jids = new Set();
+    if (msg && msg.key) {
+        if (msg.key.participant) jids.add(msg.key.participant);
+        if (msg.key.participantAlt) jids.add(msg.key.participantAlt);
+        if (msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') jids.add(msg.key.remoteJid);
+    }
+    if (msg && msg.participant) jids.add(msg.participant);
+    return Array.from(jids).filter(Boolean);
+}
 
-async function processStatusQueue(sock) {
+// =========================================================
+// STORY-BATCH SYNC ENGINE (Atomic Multi-Slide & Multi-Person)
+// =========================================================
+const pendingStatusMap = new Map(); // authorJid -> Array of { msg, id, keys }
+let isProcessingBatch = false;
+
+function queueStatusForBatch(msg, force = false) {
+    if (!msg || !msg.key || !msg.key.id) return;
+    const statusId = msg.key.id;
+
+    if (!force && viewedStatusSet.has(statusId)) return;
+
+    const participant = msg.key.participant || msg.participant;
+    if (!participant || participant === 'status@broadcast') return;
+
+    if (!pendingStatusMap.has(participant)) {
+        pendingStatusMap.set(participant, []);
+    }
+
+    const list = pendingStatusMap.get(participant);
+    if (!list.some(item => item.id === statusId)) {
+        list.push({ msg, id: statusId });
+    }
+}
+
+async function processBatchStatusQueue(sock) {
     const activeConfig = getConfig();
     if (activeConfig.AUTO_STATUS_VIEW === 'off') {
-        statusQueue.length = 0;
+        pendingStatusMap.clear();
         return;
     }
 
-    if (isProcessingQueue) return;
-    isProcessingQueue = true;
+    if (isProcessingBatch) return;
+    isProcessingBatch = true;
 
     try {
-        while (statusQueue.length > 0) {
+        while (pendingStatusMap.size > 0) {
             const currentCfg = getConfig();
             if (currentCfg.AUTO_STATUS_VIEW === 'off') {
-                statusQueue.length = 0;
+                pendingStatusMap.clear();
                 break;
             }
 
-            const item = statusQueue.shift();
-            if (!item || !item.msg || !item.msg.key) continue;
+            // Get first author's batch of status updates
+            const [authorJid, items] = pendingStatusMap.entries().next().value;
+            pendingStatusMap.delete(authorJid);
 
-            const statusId = item.msg.key.id;
-            const participant = item.msg.key.participant || item.msg.participant;
+            if (!items || items.length === 0) continue;
 
-            if (!item.force && viewedStatusSet.has(statusId)) continue;
-            if (!participant || participant === 'status@broadcast') continue;
+            const allKeys = items.map(item => item.msg.key).filter(Boolean);
+            const allIds = items.map(item => item.id).filter(Boolean);
+
+            // Collect all JID variations (LID + Phone Number) for this author
+            const allTargetJids = new Set();
+            items.forEach(item => {
+                extractParticipantJids(item.msg).forEach(jid => allTargetJids.add(jid));
+            });
+            if (allTargetJids.size === 0) allTargetJids.add(authorJid);
 
             try {
-                // 1. Pass the original untouched msg.key to trigger native Baileys handling
-                await sock.readMessages([item.msg.key]);
+                // 1. Mark ALL slides for this contact in one atomic Baileys call
+                await sock.readMessages(allKeys);
 
-                // 2. Deliver contact read receipt
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read').catch(() => null);
-                    
-                    // 3. Spaced delay before sending multi-device read-self stanza
-                    await new Promise(res => setTimeout(res, 200));
-                    
-                    // 4. Deliver read-self stanza to trigger phone UI sync
-                    await sock.sendReceipt('status@broadcast', participant, [statusId], 'read-self').catch(() => null);
+                // 2. Deliver dual receipt stanzas (read + read-self) across all IDs and JID types
+                for (const targetJid of allTargetJids) {
+                    if (sock.sendReceipt) {
+                        await sock.sendReceipt('status@broadcast', targetJid, allIds, 'read').catch(() => null);
+                        await sock.sendReceipt('status@broadcast', targetJid, allIds, 'read-self').catch(() => null);
+                    }
                 }
 
-                markStatusAsViewedOnDisk(statusId);
-                console.log(`[STATUS VIEWED & SYNCED] ID: ${statusId} From: ${participant}`);
+                // 3. Mark all slides on disk so unread_count drops to 0
+                allIds.forEach(id => markStatusAsViewedOnDisk(id));
+                console.log(`[STORY-BATCH SYNCED] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
             } catch (err) {}
 
-            // 250ms spacing prevents socket burst drops while remaining responsive
-            await new Promise(res => setTimeout(res, 250));
+            // Short pause between contacts
+            await new Promise(res => setTimeout(res, 100));
         }
     } finally {
-        isProcessingQueue = false;
+        isProcessingBatch = false;
     }
 }
 
@@ -218,12 +258,12 @@ async function sweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         if (!viewedStatusSet.has(id)) {
-            statusQueue.push({ msg, force: false });
+            queueStatusForBatch(msg, false);
             count++;
         }
     }
     if (count > 0) {
-        processStatusQueue(sock);
+        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -235,11 +275,11 @@ async function forceSweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         viewedStatusSet.delete(id);
-        statusQueue.push({ msg, force: true });
+        queueStatusForBatch(msg, true);
         count++;
     }
     if (count > 0) {
-        processStatusQueue(sock);
+        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -408,8 +448,27 @@ async function startBot() {
         const botUserJid = sock.user ? jidNormalizedUser(sock.user.id) : null;
         const botLid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null;
 
+        const currentCfg = getConfig();
+
+        // 1. ATOMIC STATUS BATCH GATHERING
+        const statusUpdates = [];
         for (const msg of m.messages) {
-            if (!msg.message) continue;
+            if (msg.key && msg.key.remoteJid === 'status@broadcast' && !msg.key.fromMe) {
+                trackStatusKey(msg);
+                if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
+                    statusUpdates.push(msg);
+                }
+            }
+        }
+
+        if (statusUpdates.length > 0) {
+            statusUpdates.forEach(msg => queueStatusForBatch(msg, false));
+            processBatchStatusQueue(sock);
+        }
+
+        // 2. CHAT MESSAGES & COMMANDS
+        for (const msg of m.messages) {
+            if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
 
             const fromJid = msg.key.remoteJid;
             const isGroup = fromJid.endsWith('@g.us');
@@ -420,20 +479,8 @@ async function startBot() {
                                (botUserJid && areJidsSameUser(senderJid, botUserJid)) || 
                                (botLid && areJidsSameUser(senderJid, botLid));
 
-            // 1. AUTO STATUS VIEWER (Pushing raw untouched msg directly)
-            if (msg.key && fromJid === 'status@broadcast' && !msg.key.fromMe) {
-                trackStatusKey(msg);
-
-                const currentCfg = getConfig();
-                if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
-                    statusQueue.push({ msg: msg, force: false });
-                    processStatusQueue(sock);
-                }
-                continue;
-            }
-
-            // 2. CACHE ALL CHAT MESSAGES
-            if (msg.key.id && fromJid !== 'status@broadcast') {
+            // Cache incoming chat messages
+            if (msg.key.id) {
                 messageStore.set(msg.key.id, {
                     key: msg.key,
                     message: msg.message,
@@ -448,8 +495,8 @@ async function startBot() {
                 }
             }
 
-            // 3. ANTI-DELETE PROTOCOL LISTENER
-            const activeAntiDelete = getConfig().ANTI_DELETE;
+            // Anti-Delete Protocol Listener
+            const activeAntiDelete = currentCfg.ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
                 const deletedMsg = messageStore.get(deletedKey.id);
@@ -507,7 +554,7 @@ async function startBot() {
                 }
             }
 
-            // COMMAND PARSER
+            // Command Parser
             const rawUnwrapped = unwrapMessage(msg.message);
             const textContent = rawUnwrapped?.conversation || rawUnwrapped?.extendedTextMessage?.text || '';
             if (!textContent.startsWith('.')) continue;
@@ -517,7 +564,7 @@ async function startBot() {
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
-            // COMMAND: .alive / .ping
+            // .alive / .ping
             if (['.alive', '.ping'].includes(command)) {
                 const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                 const hours = Math.floor(uptimeSec / 3600);
@@ -530,7 +577,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .react / .r
+            // .react / .r
             if (['.react', '.r', '.reaction'].includes(command)) {
                 const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
                 const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -559,7 +606,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .sticker / .s
+            // .sticker / .s
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
                 const unwrappedMedia = unwrapMessage(targetMedia);
@@ -593,7 +640,7 @@ async function startBot() {
                 continue;
             }
 
-            // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
+            // SUDO Commands
             if (isFromSudo) {
                 if (['.forceview', '.resync', '.review'].includes(command)) {
                     const count = await forceSweepAndReadStatuses(sock);
@@ -616,7 +663,7 @@ async function startBot() {
                         cacheOutgoingMessage(sent);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
-                        statusQueue.length = 0;
+                        pendingStatusMap.clear();
                         const sent = await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, { quoted: msg });
                         cacheOutgoingMessage(sent);
                     } else {
@@ -669,9 +716,7 @@ async function startBot() {
                 }
             }
 
-            // =========================================================
-            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO SUDO DM ONLY
-            // =========================================================
+            // .vv -> SUDO DM
             if (command === '.vv') {
                 if (!quotedMsg || !botUserJid) continue;
 
@@ -701,7 +746,6 @@ async function startBot() {
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
-                            // SENDS TO SUDO DM ONLY
                             const res = await sock.sendMessage(botUserJid, payload);
                             if (res?.key?.id) {
                                 cacheOutgoingMessage(res);
@@ -715,9 +759,7 @@ async function startBot() {
                 }
             }
 
-            // =========================================================
-            // 5. CONTENT SAVER (.save) -> STRICTLY TO SUDO DM ONLY
-            // =========================================================
+            // .save -> SUDO DM
             if (command === '.save') {
                 if (!quotedMsg || !botUserJid) continue;
 
@@ -746,7 +788,6 @@ async function startBot() {
                                 payload.mimetype = unwrappedSave.documentMessage?.mimetype || 'application/octet-stream';
                             }
 
-                            // SENDS TO SUDO DM ONLY
                             const res = await sock.sendMessage(botUserJid, payload);
                             if (res?.key?.id) {
                                 cacheOutgoingMessage(res);
