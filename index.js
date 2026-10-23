@@ -56,10 +56,11 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION & VIEWED STATUS TRACKER
+// PERSISTENT CONFIGURATION & STATUS CACHE
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
+const statusCachePath = path.join(__dirname, 'status_cache.json');
 
 function getConfig() {
     let defaultConfig = {
@@ -118,6 +119,26 @@ function markStatusAsViewedOnDisk(id) {
 
 const messageStore = new Map();
 const recentStatusStore = new Map();
+
+// Load persistent status cache from disk across restarts
+if (fs.existsSync(statusCachePath)) {
+    try {
+        const savedStatuses = JSON.parse(fs.readFileSync(statusCachePath, 'utf-8'));
+        savedStatuses.forEach(item => {
+            if (item && item.key && item.key.id) {
+                recentStatusStore.set(item.key.id, item);
+            }
+        });
+    } catch (e) {}
+}
+
+function saveStatusCacheToDisk() {
+    try {
+        const list = Array.from(recentStatusStore.values()).slice(-500);
+        fs.writeFileSync(statusCachePath, JSON.stringify(list));
+    } catch (e) {}
+}
+
 const startTime = Date.now();
 let activeSock = null;
 let initialActiveLogged = false;
@@ -138,10 +159,11 @@ function trackStatusKey(msg) {
     if (!msg || !msg.key || !msg.key.id) return;
     recentStatusStore.set(msg.key.id, msg);
 
-    if (recentStatusStore.size > 2000) {
+    if (recentStatusStore.size > 1000) {
         const firstKey = recentStatusStore.keys().next().value;
         recentStatusStore.delete(firstKey);
     }
+    saveStatusCacheToDisk();
 }
 
 function cacheOutgoingMessage(sentMsg) {
@@ -167,10 +189,19 @@ function extractParticipantJids(msg) {
     return Array.from(jids).filter(Boolean);
 }
 
+// Safe reply helper: Avoids quoting self in self-chat to prevent "Waiting for this message"
+async function sendSafeReply(sock, toJid, content, originalMsg) {
+    const isSelf = toJid.includes('@s.whatsapp.net') && originalMsg?.key?.fromMe;
+    const options = isSelf ? {} : { quoted: originalMsg };
+    const sent = await sock.sendMessage(toJid, content, options);
+    cacheOutgoingMessage(sent);
+    return sent;
+}
+
 // =========================================================
-// STORY-BATCH SYNC ENGINE (Atomic Multi-Slide & Multi-Person)
+// STORY-BATCH SYNC ENGINE
 // =========================================================
-const pendingStatusMap = new Map(); // authorJid -> Array of { msg, id, keys }
+const pendingStatusMap = new Map();
 let isProcessingBatch = false;
 
 function queueStatusForBatch(msg, force = false) {
@@ -210,7 +241,6 @@ async function processBatchStatusQueue(sock) {
                 break;
             }
 
-            // Get first author's batch of status updates
             const [authorJid, items] = pendingStatusMap.entries().next().value;
             pendingStatusMap.delete(authorJid);
 
@@ -219,7 +249,6 @@ async function processBatchStatusQueue(sock) {
             const allKeys = items.map(item => item.msg.key).filter(Boolean);
             const allIds = items.map(item => item.id).filter(Boolean);
 
-            // Collect all JID variations (LID + Phone Number) for this author
             const allTargetJids = new Set();
             items.forEach(item => {
                 extractParticipantJids(item.msg).forEach(jid => allTargetJids.add(jid));
@@ -230,7 +259,7 @@ async function processBatchStatusQueue(sock) {
                 // 1. Mark ALL slides for this contact in one atomic Baileys call
                 await sock.readMessages(allKeys);
 
-                // 2. Deliver dual receipt stanzas (read + read-self) across all IDs and JID types
+                // 2. Deliver dual receipt stanzas (read + read-self)
                 for (const targetJid of allTargetJids) {
                     if (sock.sendReceipt) {
                         await sock.sendReceipt('status@broadcast', targetJid, allIds, 'read').catch(() => null);
@@ -238,12 +267,10 @@ async function processBatchStatusQueue(sock) {
                     }
                 }
 
-                // 3. Mark all slides on disk so unread_count drops to 0
                 allIds.forEach(id => markStatusAsViewedOnDisk(id));
                 console.log(`[STORY-BATCH SYNCED] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
             } catch (err) {}
 
-            // Short pause between contacts
             await new Promise(res => setTimeout(res, 100));
         }
     } finally {
@@ -564,7 +591,7 @@ async function startBot() {
             const param = args[1] ? args[1].toLowerCase() : '';
             const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
-            // .alive / .ping
+            // COMMAND: .alive / .ping
             if (['.alive', '.ping'].includes(command)) {
                 const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
                 const hours = Math.floor(uptimeSec / 3600);
@@ -572,12 +599,11 @@ async function startBot() {
                 const seconds = uptimeSec % 60;
 
                 const aliveMsg = `I'm here and ready! 🚀\nUptime : ${hours} hours ${minutes} minutes ${seconds} seconds`;
-                const sent = await sock.sendMessage(fromJid, { text: aliveMsg }, { quoted: msg });
-                cacheOutgoingMessage(sent);
+                await sendSafeReply(sock, fromJid, { text: aliveMsg }, msg);
                 continue;
             }
 
-            // .react / .r
+            // COMMAND: .react / .r
             if (['.react', '.r', '.reaction'].includes(command)) {
                 const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
                 const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -600,13 +626,12 @@ async function startBot() {
                         console.log(`[.react COMMAND] Reacted with ${reactionEmoji}`);
                     } catch (err) {}
                 } else {
-                    const sent = await sock.sendMessage(fromJid, { text: '⚠️ Please reply to a message with `.react <emoji>`' }, { quoted: msg });
-                    cacheOutgoingMessage(sent);
+                    await sendSafeReply(sock, fromJid, { text: '⚠️ Please reply to a message with `.react <emoji>`' }, msg);
                 }
                 continue;
             }
 
-            // .sticker / .s
+            // COMMAND: .sticker / .s
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
                 const unwrappedMedia = unwrapMessage(targetMedia);
@@ -644,32 +669,27 @@ async function startBot() {
             if (isFromSudo) {
                 if (['.forceview', '.resync', '.review'].includes(command)) {
                     const count = await forceSweepAndReadStatuses(sock);
-                    const sent = await sock.sendMessage(fromJid, { text: `Done! Force-reviewed and resynced ${count} status updates. 🚀` }, { quoted: msg });
-                    cacheOutgoingMessage(sent);
+                    await sendSafeReply(sock, fromJid, { text: `Done! Force-reviewed and resynced ${count} status updates. 🚀` }, msg);
                     continue;
                 }
 
                 if (command === '.viewall' || command === '.readstatus') {
                     const count = await sweepAndReadStatuses(sock);
-                    const sent = await sock.sendMessage(fromJid, { text: `Done! Swept and re-viewed ${count} status updates. ✅` }, { quoted: msg });
-                    cacheOutgoingMessage(sent);
+                    await sendSafeReply(sock, fromJid, { text: `Done! Swept and re-viewed ${count} status updates. ✅` }, msg);
                     continue;
                 }
 
                 if (command === '.status') {
                     if (['no-dl', 'on', 'true'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'no-dl' });
-                        const sent = await sock.sendMessage(fromJid, { text: 'Done! Status View: [no-dl] ✅' }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [no-dl] ✅' }, msg);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
                         pendingStatusMap.clear();
-                        const sent = await sock.sendMessage(fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, msg);
                     } else {
                         const currentCfg = getConfig();
-                        const sent = await sock.sendMessage(fromJid, { text: `Current Setting: Status View = [${currentCfg.AUTO_STATUS_VIEW}]\nUsage: .status no-dl | .status off` }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: `Current Setting: Status View = [${currentCfg.AUTO_STATUS_VIEW}]\nUsage: .status no-dl | .status off` }, msg);
                     }
                     continue;
                 }
@@ -677,20 +697,16 @@ async function startBot() {
                 if (command === '.delete') {
                     if (param === 'p') {
                         updateConfig({ ANTI_DELETE: 'p' });
-                        const sent = await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [p] (Send to SUDO DM) 🗑️' }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: 'Done! Anti-Delete: [p] (Send to SUDO DM) 🗑️' }, msg);
                     } else if (param === 'g') {
                         updateConfig({ ANTI_DELETE: 'g' });
-                        const sent = await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [g] (Send to Same Group) 🗑️' }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: 'Done! Anti-Delete: [g] (Send to Same Group) 🗑️' }, msg);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ ANTI_DELETE: 'off' });
-                        const sent = await sock.sendMessage(fromJid, { text: 'Done! Anti-Delete: [off] 🛑' }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: 'Done! Anti-Delete: [off] 🛑' }, msg);
                     } else {
                         const currentCfg = getConfig();
-                        const sent = await sock.sendMessage(fromJid, { text: `Current Setting: Anti-Delete = [${currentCfg.ANTI_DELETE}]\nUsage: .delete p | .delete g | .delete off` }, { quoted: msg });
-                        cacheOutgoingMessage(sent);
+                        await sendSafeReply(sock, fromJid, { text: `Current Setting: Anti-Delete = [${currentCfg.ANTI_DELETE}]\nUsage: .delete p | .delete g | .delete off` }, msg);
                     }
                     continue;
                 }
@@ -710,8 +726,7 @@ async function startBot() {
                                      `⏱️ *UPTIME:* ${hours}h ${minutes}m\n\n` +
                                      `*Commands:* .alive, .react, .forceview, .sticker, .viewall, .status, .delete, .vv, .save`.trim();
 
-                    const sent = await sock.sendMessage(fromJid, { text: menuText }, { quoted: msg });
-                    cacheOutgoingMessage(sent);
+                    await sendSafeReply(sock, fromJid, { text: menuText }, msg);
                     continue;
                 }
             }
