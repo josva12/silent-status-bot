@@ -1,6 +1,7 @@
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
+    makeCacheableSignalKeyStore,
     DisconnectReason, 
     downloadMediaMessage, 
     getContentType, 
@@ -56,7 +57,7 @@ const rl = readline.createInterface({
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // =========================================================
-// PERSISTENT CONFIGURATION & STATUS CACHE
+// PERSISTENT CONFIGURATION
 // =========================================================
 const configPath = path.join(__dirname, 'config.json');
 const viewedPath = path.join(__dirname, 'viewed_statuses.json');
@@ -178,18 +179,7 @@ function cacheOutgoingMessage(sentMsg) {
     }
 }
 
-function extractParticipantJids(msg) {
-    const jids = new Set();
-    if (msg && msg.key) {
-        if (msg.key.participant) jids.add(msg.key.participant);
-        if (msg.key.participantAlt) jids.add(msg.key.participantAlt);
-        if (msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') jids.add(msg.key.remoteJid);
-    }
-    if (msg && msg.participant) jids.add(msg.participant);
-    return Array.from(jids).filter(Boolean);
-}
-
-// Safe reply helper: Avoids quoting self in self-chat to prevent "Waiting for this message"
+// Safe reply helper avoiding circular self-quotes
 async function sendSafeReply(sock, toJid, content, originalMsg) {
     const isSelf = toJid.includes('@s.whatsapp.net') && originalMsg?.key?.fromMe;
     const options = isSelf ? {} : { quoted: originalMsg };
@@ -199,7 +189,7 @@ async function sendSafeReply(sock, toJid, content, originalMsg) {
 }
 
 // =========================================================
-// STORY-BATCH SYNC ENGINE
+// STORY-BATCH SYNC ENGINE (Clean Native Stanzas)
 // =========================================================
 const pendingStatusMap = new Map();
 let isProcessingBatch = false;
@@ -219,7 +209,7 @@ function queueStatusForBatch(msg, force = false) {
 
     const list = pendingStatusMap.get(participant);
     if (!list.some(item => item.id === statusId)) {
-        list.push({ msg, id: statusId });
+        list.push({ msg, id: statusId, key: msg.key });
     }
 }
 
@@ -246,32 +236,19 @@ async function processBatchStatusQueue(sock) {
 
             if (!items || items.length === 0) continue;
 
-            const allKeys = items.map(item => item.msg.key).filter(Boolean);
+            const allKeys = items.map(item => item.key).filter(Boolean);
             const allIds = items.map(item => item.id).filter(Boolean);
 
-            const allTargetJids = new Set();
-            items.forEach(item => {
-                extractParticipantJids(item.msg).forEach(jid => allTargetJids.add(jid));
-            });
-            if (allTargetJids.size === 0) allTargetJids.add(authorJid);
-
             try {
-                // 1. Mark ALL slides for this contact in one atomic Baileys call
+                // Official native WhatsApp Web read method:
+                // Calls readMessages with all original keys, emitting correct protocol stanzas
                 await sock.readMessages(allKeys);
-
-                // 2. Deliver dual receipt stanzas (read + read-self)
-                for (const targetJid of allTargetJids) {
-                    if (sock.sendReceipt) {
-                        await sock.sendReceipt('status@broadcast', targetJid, allIds, 'read').catch(() => null);
-                        await sock.sendReceipt('status@broadcast', targetJid, allIds, 'read-self').catch(() => null);
-                    }
-                }
 
                 allIds.forEach(id => markStatusAsViewedOnDisk(id));
                 console.log(`[STORY-BATCH SYNCED] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
             } catch (err) {}
 
-            await new Promise(res => setTimeout(res, 100));
+            await new Promise(res => setTimeout(res, 200));
         }
     } finally {
         isProcessingBatch = false;
@@ -345,8 +322,12 @@ async function startBot() {
         }
     }
 
+    // Wrap keys in makeCacheableSignalKeyStore to prevent file-lock collisions and closed sessions
     const sock = makeWASocket({
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+        },
         logger: pino({ level: 'silent' }),
         generateHighQualityLinkPreview: false,
         keepAliveIntervalMs: 30000,
@@ -665,7 +646,7 @@ async function startBot() {
                 continue;
             }
 
-            // SUDO Commands
+            // DYNAMIC IN-CHAT COMMANDS (SUDO / OWNER ONLY)
             if (isFromSudo) {
                 if (['.forceview', '.resync', '.review'].includes(command)) {
                     const count = await forceSweepAndReadStatuses(sock);
