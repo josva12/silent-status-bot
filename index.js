@@ -104,13 +104,16 @@ if (fs.existsSync(viewedPath)) {
     } catch (e) {}
 }
 
-function markStatusAsViewedOnDisk(id) {
-    if (!id) return;
-    viewedStatusSet.add(id);
+function markStatusAsViewedOnDisk(ids) {
+    if (!Array.isArray(ids)) ids = [ids];
+    ids.forEach(id => viewedStatusSet.add(id));
 
     if (viewedStatusSet.size > 5000) {
-        const first = viewedStatusSet.values().next().value;
-        viewedStatusSet.delete(first);
+        const excess = viewedStatusSet.size - 5000;
+        const it = viewedStatusSet.values();
+        for (let i = 0; i < excess; i++) {
+            viewedStatusSet.delete(it.next().value);
+        }
     }
 
     try {
@@ -121,12 +124,11 @@ function markStatusAsViewedOnDisk(id) {
 const messageStore = new Map();
 const recentStatusStore = new Map();
 
-// Load persistent status cache from disk across restarts
 if (fs.existsSync(statusCachePath)) {
     try {
         const savedStatuses = JSON.parse(fs.readFileSync(statusCachePath, 'utf-8'));
         savedStatuses.forEach(item => {
-            if (item && item.key && item.key.id) {
+            if (item?.key?.id) {
                 recentStatusStore.set(item.key.id, item);
             }
         });
@@ -179,7 +181,6 @@ function cacheOutgoingMessage(sentMsg) {
     }
 }
 
-// Safe reply helper avoiding circular self-quotes
 async function sendSafeReply(sock, toJid, content, originalMsg) {
     const isSelf = toJid.includes('@s.whatsapp.net') && originalMsg?.key?.fromMe;
     const options = isSelf ? {} : { quoted: originalMsg };
@@ -189,13 +190,14 @@ async function sendSafeReply(sock, toJid, content, originalMsg) {
 }
 
 // =========================================================
-// STORY-BATCH SYNC ENGINE (Clean Native Stanzas)
+// DEBOUNCED STORY AGGREGATOR (Handles Multi-Slide & Multi-Person Bursts)
 // =========================================================
-const pendingStatusMap = new Map();
+const statusAggregator = new Map(); // authorJid -> Map(statusId -> key)
+let debounceTimer = null;
 let isProcessingBatch = false;
 
-function queueStatusForBatch(msg, force = false) {
-    if (!msg || !msg.key || !msg.key.id) return;
+function queueStatusForAggregator(msg, force = false) {
+    if (!msg?.key?.id) return;
     const statusId = msg.key.id;
 
     if (!force && viewedStatusSet.has(statusId)) return;
@@ -203,20 +205,26 @@ function queueStatusForBatch(msg, force = false) {
     const participant = msg.key.participant || msg.participant;
     if (!participant || participant === 'status@broadcast') return;
 
-    if (!pendingStatusMap.has(participant)) {
-        pendingStatusMap.set(participant, []);
+    if (!statusAggregator.has(participant)) {
+        statusAggregator.set(participant, new Map());
     }
 
-    const list = pendingStatusMap.get(participant);
-    if (!list.some(item => item.id === statusId)) {
-        list.push({ msg, id: statusId, key: msg.key });
-    }
+    const authorMap = statusAggregator.get(participant);
+    authorMap.set(statusId, msg.key);
+
+    // Reset debounce timer to allow multi-slide bursts from all contacts to group together
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        if (activeSock) {
+            triggerAggregatedBatch(activeSock);
+        }
+    }, 1500); // 1.5s window catches multi-slide burst uploads
 }
 
-async function processBatchStatusQueue(sock) {
+async function triggerAggregatedBatch(sock) {
     const activeConfig = getConfig();
     if (activeConfig.AUTO_STATUS_VIEW === 'off') {
-        pendingStatusMap.clear();
+        statusAggregator.clear();
         return;
     }
 
@@ -224,32 +232,31 @@ async function processBatchStatusQueue(sock) {
     isProcessingBatch = true;
 
     try {
-        while (pendingStatusMap.size > 0) {
-            const currentCfg = getConfig();
-            if (currentCfg.AUTO_STATUS_VIEW === 'off') {
-                pendingStatusMap.clear();
-                break;
-            }
+        for (const [authorJid, itemsMap] of statusAggregator.entries()) {
+            if (itemsMap.size === 0) continue;
 
-            const [authorJid, items] = pendingStatusMap.entries().next().value;
-            pendingStatusMap.delete(authorJid);
-
-            if (!items || items.length === 0) continue;
-
-            const allKeys = items.map(item => item.key).filter(Boolean);
-            const allIds = items.map(item => item.id).filter(Boolean);
+            const allKeys = Array.from(itemsMap.values());
+            const allIds = Array.from(itemsMap.keys());
 
             try {
-                // Official native WhatsApp Web read method:
-                // Calls readMessages with all original keys, emitting correct protocol stanzas
+                // 1. Mark ALL slides for this contact in one single atomic call
                 await sock.readMessages(allKeys);
 
-                allIds.forEach(id => markStatusAsViewedOnDisk(id));
-                console.log(`[STORY-BATCH SYNCED] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
+                // 2. Send multi-device read-self receipt for all slides simultaneously
+                if (sock.sendReceipt) {
+                    await sock.sendReceipt('status@broadcast', authorJid, allIds, 'read').catch(() => null);
+                    await new Promise(res => setTimeout(res, 150));
+                    await sock.sendReceipt('status@broadcast', authorJid, allIds, 'read-self').catch(() => null);
+                }
+
+                markStatusAsViewedOnDisk(allIds);
+                console.log(`[STORY-BATCH SYNCED 100%] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
             } catch (err) {}
 
+            // Pause between contacts to prevent socket rate limits
             await new Promise(res => setTimeout(res, 200));
         }
+        statusAggregator.clear();
     } finally {
         isProcessingBatch = false;
     }
@@ -262,12 +269,9 @@ async function sweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         if (!viewedStatusSet.has(id)) {
-            queueStatusForBatch(msg, false);
+            queueStatusForAggregator(msg, false);
             count++;
         }
-    }
-    if (count > 0) {
-        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -279,11 +283,8 @@ async function forceSweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         viewedStatusSet.delete(id);
-        queueStatusForBatch(msg, true);
+        queueStatusForAggregator(msg, true);
         count++;
-    }
-    if (count > 0) {
-        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -322,7 +323,6 @@ async function startBot() {
         }
     }
 
-    // Wrap keys in makeCacheableSignalKeyStore to prevent file-lock collisions and closed sessions
     const sock = makeWASocket({
         auth: {
             creds: state.creds,
@@ -458,20 +458,14 @@ async function startBot() {
 
         const currentCfg = getConfig();
 
-        // 1. ATOMIC STATUS BATCH GATHERING
-        const statusUpdates = [];
+        // 1. DEBOUNCED AGGREGATION FOR ALL STATUS UPDATES
         for (const msg of m.messages) {
             if (msg.key && msg.key.remoteJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
                 if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
-                    statusUpdates.push(msg);
+                    queueStatusForAggregator(msg, false);
                 }
             }
-        }
-
-        if (statusUpdates.length > 0) {
-            statusUpdates.forEach(msg => queueStatusForBatch(msg, false));
-            processBatchStatusQueue(sock);
         }
 
         // 2. CHAT MESSAGES & COMMANDS
@@ -666,7 +660,7 @@ async function startBot() {
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [no-dl] ✅' }, msg);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
-                        pendingStatusMap.clear();
+                        statusAggregator.clear();
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, msg);
                     } else {
                         const currentCfg = getConfig();
@@ -712,7 +706,9 @@ async function startBot() {
                 }
             }
 
-            // .vv -> SUDO DM
+            // =========================================================
+            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO SUDO DM ONLY
+            // =========================================================
             if (command === '.vv') {
                 if (!quotedMsg || !botUserJid) continue;
 
@@ -755,7 +751,9 @@ async function startBot() {
                 }
             }
 
-            // .save -> SUDO DM
+            // =========================================================
+            // 5. CONTENT SAVER (.save) -> STRICTLY TO SUDO DM ONLY
+            // =========================================================
             if (command === '.save') {
                 if (!quotedMsg || !botUserJid) continue;
 
