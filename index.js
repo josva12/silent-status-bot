@@ -172,6 +172,7 @@ const startTime = Date.now();
 let activeSock = null;
 let initialActiveLogged = false;
 let sweeperInterval = null;
+let targetVaultGroupJid = null;
 
 function unwrapMessage(msg) {
     if (!msg) return null;
@@ -457,6 +458,18 @@ async function startBot() {
                 console.log(`✅ Silent Status Bot Active v2.0.0! Designed by Josva.`);
             }
 
+            // Auto-detect private vault group if present
+            try {
+                const groups = await sock.groupFetchAllParticipating();
+                for (const jid in groups) {
+                    if (groups[jid].subject && groups[jid].subject.toLowerCase() === 'silent-status') {
+                        targetVaultGroupJid = jid;
+                        console.log(`🎯 VAULT GROUP ACTIVE: "Silent-status" (${targetVaultGroupJid})`);
+                        break;
+                    }
+                }
+            } catch (e) {}
+
             if (getConfig().AUTO_STATUS_VIEW !== 'off') {
                 sweepAndReadStatuses(sock);
             }
@@ -543,6 +556,9 @@ async function startBot() {
                                (botUserJid && areJidsSameUser(senderJid, botUserJid)) || 
                                (botLid && areJidsSameUser(senderJid, botLid));
 
+            // CRITICAL FIX: Strictly send to botUserJid (@s.whatsapp.net) for phone decryption!
+            const resolvedSudoTarget = targetVaultGroupJid || botUserJid;
+
             // Cache incoming chat messages
             if (msg.key.id) {
                 messageStore.set(msg.key.id, {
@@ -567,7 +583,7 @@ async function startBot() {
 
                 if (deletedMsg && botUserJid) {
                     try {
-                        const targetChat = activeAntiDelete === 'g' ? fromJid : botUserJid;
+                        const targetChat = activeAntiDelete === 'g' ? fromJid : resolvedSudoTarget;
                         const senderNumber = (deletedMsg.participant || fromJid).split('@')[0];
                         const header = `🗑️ *Anti-Delete Alert*\n👤 *Sender:* @${senderNumber}\n💬 *Chat:* ${isGroup ? 'Group' : 'Private'}\n\n`;
 
@@ -614,16 +630,13 @@ async function startBot() {
                         }
 
                         if (mediaPayload) {
-                            if (targetChat === botUserJid) {
+                            if (targetChat.endsWith('@g.us')) {
+                                const res = await sock.sendMessage(targetChat, mediaPayload);
+                                if (res?.key?.id) cacheOutgoingMessage(res);
+                            } else {
                                 queueMessageToSudo(sock, targetChat, mediaPayload).then(res => {
                                     if (res?.key?.id) console.log(`[ANTI-DELETE TRIGGERED] Restored message cleanly to SUDO DM`);
                                 });
-                            } else {
-                                const res = await sock.sendMessage(targetChat, mediaPayload);
-                                if (res?.key?.id) {
-                                    cacheOutgoingMessage(res);
-                                    console.log(`[ANTI-DELETE TRIGGERED] Restored message to ${targetChat}`);
-                                }
                             }
                         }
                     } catch (err) {}
@@ -787,10 +800,10 @@ async function startBot() {
             }
 
             // =========================================================
-            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO botUserJid (SUDO DM)
+            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO botUserJid
             // =========================================================
             if (command === '.vv') {
-                if (!quotedMsg || !botUserJid) continue;
+                if (!quotedMsg || !resolvedSudoTarget) continue;
 
                 const unwrappedVO = unwrapMessage(quotedMsg);
                 const voType = unwrappedVO ? getContentType(unwrappedVO) : null;
@@ -806,7 +819,8 @@ async function startBot() {
                         if (buffer) {
                             const senderName = (msg.message.extendedTextMessage.contextInfo.participant || fromJid).split('@')[0];
                             const payload = { 
-                                caption: `🔓 *Unlocked View-Once Media*\n👤 *From:* @${senderName}\n💬 *Origin:* ${isGroup ? 'Group' : 'Private'}`
+                                caption: `🔓 *Unlocked View-Once Media*\n👤 *From:* @${senderName}\n💬 *Origin:* ${isGroup ? 'Group' : 'Private'}`,
+                                mentions: [msg.message.extendedTextMessage.contextInfo.participant || fromJid]
                             };
                             
                             if (voType === 'imageMessage') {
@@ -821,12 +835,14 @@ async function startBot() {
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
-                            // SENDS TO botUserJid (SUDO DM) ONLY with 900ms paced queue
-                            queueMessageToSudo(sock, botUserJid, payload).then(res => {
-                                if (res?.key?.id) {
-                                    console.log(`[.vv COMMAND] View-Once unlocked to SUDO DM (ID: ${res.key.id})`);
-                                }
-                            });
+                            if (resolvedSudoTarget.endsWith('@g.us')) {
+                                const res = await sock.sendMessage(resolvedSudoTarget, payload);
+                                if (res?.key?.id) cacheOutgoingMessage(res);
+                            } else {
+                                queueMessageToSudo(sock, resolvedSudoTarget, payload).then(res => {
+                                    if (res?.key?.id) console.log(`[.vv COMMAND] View-Once unlocked to SUDO DM (ID: ${res.key.id})`);
+                                });
+                            }
                         }
                     } catch (err) {}
                 } else {
@@ -835,10 +851,10 @@ async function startBot() {
             }
 
             // =========================================================
-            // 5. CONTENT SAVER (.save) -> STRICTLY TO botUserJid (SUDO DM)
+            // 5. CONTENT SAVER (.save) -> STRICTLY TO botUserJid
             // =========================================================
             if (command === '.save') {
-                if (!quotedMsg || !botUserJid) continue;
+                if (!quotedMsg || !resolvedSudoTarget) continue;
 
                 try {
                     const unwrappedSave = unwrapMessage(quotedMsg);
@@ -873,20 +889,25 @@ async function startBot() {
                                 payload.fileName = unwrappedSave.documentMessage?.fileName || 'document';
                             }
 
-                            // SENDS TO botUserJid (SUDO DM) ONLY with 900ms paced queue
-                            queueMessageToSudo(sock, botUserJid, payload).then(res => {
-                                if (res?.key?.id) {
-                                    console.log(`[.save COMMAND] Content saved silently to SUDO DM (ID: ${res.key.id})`);
-                                }
-                            });
+                            if (resolvedSudoTarget.endsWith('@g.us')) {
+                                const res = await sock.sendMessage(resolvedSudoTarget, payload);
+                                if (res?.key?.id) cacheOutgoingMessage(res);
+                            } else {
+                                queueMessageToSudo(sock, resolvedSudoTarget, payload).then(res => {
+                                    if (res?.key?.id) console.log(`[.save COMMAND] Content saved silently to SUDO DM (ID: ${res.key.id})`);
+                                });
+                            }
                         }
                     } else {
                         const saveText = unwrappedSave?.conversation || unwrappedSave?.extendedTextMessage?.text || 'Text content';
-                        queueMessageToSudo(sock, botUserJid, { text: saveText }).then(res => {
-                            if (res?.key?.id) {
-                                console.log(`[.save COMMAND] Text saved silently to SUDO DM (ID: ${res.key.id})`);
-                            }
-                        });
+                        if (resolvedSudoTarget.endsWith('@g.us')) {
+                            const res = await sock.sendMessage(resolvedSudoTarget, { text: saveText });
+                            if (res?.key?.id) cacheOutgoingMessage(res);
+                        } else {
+                            queueMessageToSudo(sock, resolvedSudoTarget, { text: saveText }).then(res => {
+                                if (res?.key?.id) console.log(`[.save COMMAND] Text saved silently to SUDO DM (ID: ${res.key.id})`);
+                            });
+                        }
                     }
                 } catch (err) {}
             }
