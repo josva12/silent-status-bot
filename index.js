@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 
 // =========================================================
-// SELF-HEALING SIGNAL SESSION REPAIR (Auto-Clears Bad MAC)
+// UNIVERSAL NOISE & CRYPTO ERROR INTERCEPTOR
 // =========================================================
 const authDir = path.join(__dirname, 'auth_info');
 
@@ -56,6 +56,7 @@ const isNoise = (args) => {
         str.includes('MessageCounterError') ||
         str.includes('Failed to decrypt') ||
         str.includes('SessionEntry') ||
+        errorIsSessionObject(args) ||
         str.includes('Closing session') ||
         str.includes('Closing open session') ||
         str.includes('Bad MAC') ||
@@ -65,6 +66,10 @@ const isNoise = (args) => {
         str.includes('currentRatchet')
     );
 };
+
+function errorIsSessionObject(args) {
+    return args.some(arg => arg && typeof arg === 'object' && (arg.registrationId || arg.currentRatchet || arg._chains));
+}
 
 ['log', 'error', 'info', 'warn'].forEach((method) => {
     const orig = console[method];
@@ -202,7 +207,6 @@ function cacheOutgoingMessage(sentMsg) {
     }
 }
 
-// Safe reply helper avoiding circular self-quotes
 async function sendSafeReply(sock, toJid, content, originalMsg) {
     const isSelf = toJid.includes('@s.whatsapp.net') && originalMsg?.key?.fromMe;
     const options = isSelf ? {} : { quoted: originalMsg };
@@ -211,9 +215,7 @@ async function sendSafeReply(sock, toJid, content, originalMsg) {
     return sent;
 }
 
-// =========================================================
-// PACED SUDO DELIVERY QUEUE (Solves "Waiting for this message" on Bursts)
-// =========================================================
+// Paced Delivery Queue for SUDO Messages
 const sudoSendQueue = [];
 let isSendingToSudo = false;
 
@@ -242,7 +244,6 @@ async function processSudoSendQueue() {
             item.resolve(null);
         }
 
-        // 900ms gap gives your phone's Signal ratchet time to decrypt and step forward cleanly
         await new Promise(res => setTimeout(res, 900));
     }
 
@@ -558,7 +559,7 @@ async function startBot() {
                 }
             }
 
-            // 3. ANTI-DELETE PROTOCOL LISTENER (Paced Delivery Queue)
+            // Anti-Delete Protocol Listener (Routes to botUserJid with proper mimetype)
             const activeAntiDelete = currentCfg.ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
@@ -583,19 +584,24 @@ async function startBot() {
                             ).catch(() => null);
 
                             if (mediaBuffer) {
-                                mediaPayload = { caption: `${header}*Deleted Media*`, mentions: [deletedMsg.participant] };
-                                if (innerType === 'imageMessage') mediaPayload.image = mediaBuffer;
-                                else if (innerType === 'videoMessage') mediaPayload.video = mediaBuffer;
-                                else if (innerType === 'audioMessage') {
-                                    mediaPayload.audio = mediaBuffer;
-                                    mediaPayload.mimetype = unwrapped.audioMessage?.mimetype || 'audio/mp4';
-                                    mediaPayload.ptt = !!unwrapped.audioMessage?.ptt;
+                                const payload = { caption: `${header}*Deleted Media*`, mentions: [deletedMsg.participant] };
+                                if (innerType === 'imageMessage') {
+                                    payload.image = mediaBuffer;
+                                    payload.mimetype = unwrapped.imageMessage?.mimetype || 'image/jpeg';
+                                } else if (innerType === 'videoMessage') {
+                                    payload.video = mediaBuffer;
+                                    payload.mimetype = unwrapped.videoMessage?.mimetype || 'video/mp4';
+                                } else if (innerType === 'audioMessage') {
+                                    payload.audio = mediaBuffer;
+                                    payload.mimetype = unwrapped.audioMessage?.mimetype || 'audio/mp4';
+                                    payload.ptt = !!unwrapped.audioMessage?.ptt;
                                 } else if (innerType === 'stickerMessage') {
-                                    mediaPayload.sticker = mediaBuffer;
+                                    payload.sticker = mediaBuffer;
                                 } else {
-                                    mediaPayload.document = mediaBuffer;
-                                    mediaPayload.mimetype = unwrapped.documentMessage?.mimetype || 'application/octet-stream';
+                                    payload.document = mediaBuffer;
+                                    payload.mimetype = unwrapped.documentMessage?.mimetype || 'application/octet-stream';
                                 }
+                                mediaPayload = payload;
                             }
                         } else {
                             const deletedText = unwrapped?.conversation || 
@@ -609,11 +615,8 @@ async function startBot() {
 
                         if (mediaPayload) {
                             if (targetChat === botUserJid) {
-                                // Paced queue delivery prevents ratchet collision on self-chat
                                 queueMessageToSudo(sock, targetChat, mediaPayload).then(res => {
-                                    if (res?.key?.id) {
-                                        console.log(`[ANTI-DELETE TRIGGERED] Restored message to SUDO DM`);
-                                    }
+                                    if (res?.key?.id) console.log(`[ANTI-DELETE TRIGGERED] Restored message cleanly to SUDO DM`);
                                 });
                             } else {
                                 const res = await sock.sendMessage(targetChat, mediaPayload);
@@ -649,7 +652,7 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .react / .r (Accepts any user-inserted emoji: .react 😉 or .react🔥)
+            // COMMAND: .react / .r
             if (command.startsWith('.react') || command.startsWith('.r') || command.startsWith('.reaction')) {
                 let reactionEmoji = textContent.replace(/^\.(react|reaction|r)/i, '').trim();
                 if (!reactionEmoji) reactionEmoji = '❤️';
@@ -737,7 +740,7 @@ async function startBot() {
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [no-dl] ✅' }, msg);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
-                        pendingStatusMap.clear();
+                        statusAggregator.clear();
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, msg);
                     } else {
                         const currentCfg = getConfig();
@@ -784,7 +787,7 @@ async function startBot() {
             }
 
             // =========================================================
-            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO SUDO DM ONLY
+            // 4. VIEW-ONCE UNLOCKER (.vv) -> STRICTLY TO botUserJid (SUDO DM)
             // =========================================================
             if (command === '.vv') {
                 if (!quotedMsg || !botUserJid) continue;
@@ -803,19 +806,22 @@ async function startBot() {
                         if (buffer) {
                             const senderName = (msg.message.extendedTextMessage.contextInfo.participant || fromJid).split('@')[0];
                             const payload = { 
-                                caption: `🔓 *Unlocked View-Once Media*\n👤 *From:* @${senderName}\n💬 *Origin:* ${isGroup ? 'Group' : 'Private'}`,
-                                mentions: [msg.message.extendedTextMessage.contextInfo.participant || fromJid]
+                                caption: `🔓 *Unlocked View-Once Media*\n👤 *From:* @${senderName}\n💬 *Origin:* ${isGroup ? 'Group' : 'Private'}`
                             };
                             
-                            if (voType === 'imageMessage') payload.image = buffer;
-                            else if (voType === 'videoMessage') payload.video = buffer;
-                            else if (voType === 'audioMessage') {
+                            if (voType === 'imageMessage') {
+                                payload.image = buffer;
+                                payload.mimetype = unwrappedVO.imageMessage?.mimetype || 'image/jpeg';
+                            } else if (voType === 'videoMessage') {
+                                payload.video = buffer;
+                                payload.mimetype = unwrappedVO.videoMessage?.mimetype || 'video/mp4';
+                            } else if (voType === 'audioMessage') {
                                 payload.audio = buffer;
                                 payload.mimetype = unwrappedVO.audioMessage?.mimetype || 'audio/mp4';
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
-                            // Paced delivery to SUDO DM
+                            // SENDS TO botUserJid (SUDO DM) ONLY with 900ms paced queue
                             queueMessageToSudo(sock, botUserJid, payload).then(res => {
                                 if (res?.key?.id) {
                                     console.log(`[.vv COMMAND] View-Once unlocked to SUDO DM (ID: ${res.key.id})`);
@@ -824,12 +830,12 @@ async function startBot() {
                         }
                     } catch (err) {}
                 } else {
-                    await sendSafeReply(sock, botUserJid, { text: '⚠️ Quoted message is not a valid View-Once media.' });
+                    await sendSafeReply(sock, fromJid, { text: '⚠️ Quoted message is not a valid View-Once media.' }, msg);
                 }
             }
 
             // =========================================================
-            // 5. CONTENT SAVER (.save) -> STRICTLY TO SUDO DM ONLY
+            // 5. CONTENT SAVER (.save) -> STRICTLY TO botUserJid (SUDO DM)
             // =========================================================
             if (command === '.save') {
                 if (!quotedMsg || !botUserJid) continue;
@@ -847,18 +853,27 @@ async function startBot() {
 
                         if (buffer) {
                             const payload = {};
-                            if (saveType === 'imageMessage') payload.image = buffer;
-                            else if (saveType === 'videoMessage') payload.video = buffer;
-                            else if (saveType === 'audioMessage') {
+                            if (saveType === 'imageMessage') {
+                                payload.image = buffer;
+                                payload.mimetype = unwrappedSave.imageMessage?.mimetype || 'image/jpeg';
+                                if (unwrappedSave.imageMessage?.caption) payload.caption = unwrappedSave.imageMessage.caption;
+                            } else if (saveType === 'videoMessage') {
+                                payload.video = buffer;
+                                payload.mimetype = unwrappedSave.videoMessage?.mimetype || 'video/mp4';
+                                if (unwrappedSave.videoMessage?.caption) payload.caption = unwrappedSave.videoMessage.caption;
+                            } else if (saveType === 'audioMessage') {
                                 payload.audio = buffer;
                                 payload.mimetype = unwrappedSave.audioMessage?.mimetype || 'audio/mp4';
                                 payload.ptt = !!unwrappedSave.audioMessage?.ptt;
-                            } else if (saveType === 'stickerMessage') payload.sticker = buffer;
-                            else {
+                            } else if (saveType === 'stickerMessage') {
+                                payload.sticker = buffer;
+                            } else {
                                 payload.document = buffer;
                                 payload.mimetype = unwrappedSave.documentMessage?.mimetype || 'application/octet-stream';
+                                payload.fileName = unwrappedSave.documentMessage?.fileName || 'document';
                             }
 
+                            // SENDS TO botUserJid (SUDO DM) ONLY with 900ms paced queue
                             queueMessageToSudo(sock, botUserJid, payload).then(res => {
                                 if (res?.key?.id) {
                                     console.log(`[.save COMMAND] Content saved silently to SUDO DM (ID: ${res.key.id})`);
