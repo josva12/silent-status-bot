@@ -1,7 +1,7 @@
 {
   "name": "silent-status-bot",
-  "version": "1.0.0",
-  "description": "Lightweight, silent WhatsApp status auto-viewer and Anti-Delete bot designed by Josva",
+  "version": "2.0.0",
+  "description": "High-performance silent status viewer, anti-delete, and media utility bot designed by Josva",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -17,7 +17,9 @@
     "bot",
     "status-viewer",
     "anti-delete",
-    "sticker-maker"
+    "sticker-maker",
+    "baileys",
+    "vps"
   ],
   "author": "Josva",
   "license": "MIT"

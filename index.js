@@ -14,7 +14,29 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-// Universal Noise Filter for PM2 Logs
+// =========================================================
+// SELF-HEALING SIGNAL SESSION REPAIR (Fixes Bad MAC & Waiting for this message)
+// =========================================================
+const authDir = path.join(__dirname, 'auth_info');
+
+function autoRepairBadMacSession(identifier) {
+    if (!identifier) return;
+    const cleanId = String(identifier).split('.')[0].replace(/[^0-9]/g, '');
+    if (!cleanId || cleanId.length < 5) return;
+
+    try {
+        if (fs.existsSync(authDir)) {
+            const files = fs.readdirSync(authDir);
+            for (const file of files) {
+                if (file.startsWith(`session-${cleanId}`)) {
+                    fs.unlinkSync(path.join(authDir, file));
+                    console.log(`[AUTO-REPAIR] Cleared corrupted session: ${file}`);
+                }
+            }
+        }
+    } catch (e) {}
+}
+
 const isNoise = (args) => {
     const str = args.map(a => {
         if (typeof a === 'object') {
@@ -23,11 +45,18 @@ const isNoise = (args) => {
         return String(a);
     }).join(' ');
 
+    // Detect Bad MAC error and trigger automatic session repair
+    if (str.includes('Bad MAC')) {
+        const match = str.match(/async\s+([0-9]+)\.0/);
+        if (match && match[1]) {
+            autoRepairBadMacSession(match[1]);
+        }
+    }
+
     return (
         str.includes('MessageCounterError') ||
         str.includes('Failed to decrypt') ||
         str.includes('SessionEntry') ||
-        errorIsSessionObject(args) ||
         str.includes('Closing session') ||
         str.includes('Closing open session') ||
         str.includes('Bad MAC') ||
@@ -37,10 +66,6 @@ const isNoise = (args) => {
         str.includes('currentRatchet')
     );
 };
-
-function errorIsSessionObject(args) {
-    return args.some(arg => arg && typeof arg === 'object' && (arg.registrationId || arg.currentRatchet || arg._chains));
-}
 
 ['log', 'error', 'info', 'warn'].forEach((method) => {
     const orig = console[method];
@@ -104,16 +129,13 @@ if (fs.existsSync(viewedPath)) {
     } catch (e) {}
 }
 
-function markStatusAsViewedOnDisk(ids) {
-    if (!Array.isArray(ids)) ids = [ids];
-    ids.forEach(id => viewedStatusSet.add(id));
+function markStatusAsViewedOnDisk(id) {
+    if (!id) return;
+    viewedStatusSet.add(id);
 
     if (viewedStatusSet.size > 5000) {
-        const excess = viewedStatusSet.size - 5000;
-        const it = viewedStatusSet.values();
-        for (let i = 0; i < excess; i++) {
-            viewedStatusSet.delete(it.next().value);
-        }
+        const first = viewedStatusSet.values().next().value;
+        viewedStatusSet.delete(first);
     }
 
     try {
@@ -190,14 +212,13 @@ async function sendSafeReply(sock, toJid, content, originalMsg) {
 }
 
 // =========================================================
-// DEBOUNCED STORY AGGREGATOR (Handles Multi-Slide & Multi-Person Bursts)
+// STORY-BATCH SYNC ENGINE (PRESERVED UNCHANGED)
 // =========================================================
-const statusAggregator = new Map(); // authorJid -> Map(statusId -> key)
-let debounceTimer = null;
+const pendingStatusMap = new Map();
 let isProcessingBatch = false;
 
-function queueStatusForAggregator(msg, force = false) {
-    if (!msg?.key?.id) return;
+function queueStatusForBatch(msg, force = false) {
+    if (!msg || !msg.key || !msg.key.id) return;
     const statusId = msg.key.id;
 
     if (!force && viewedStatusSet.has(statusId)) return;
@@ -205,26 +226,20 @@ function queueStatusForAggregator(msg, force = false) {
     const participant = msg.key.participant || msg.participant;
     if (!participant || participant === 'status@broadcast') return;
 
-    if (!statusAggregator.has(participant)) {
-        statusAggregator.set(participant, new Map());
+    if (!pendingStatusMap.has(participant)) {
+        pendingStatusMap.set(participant, []);
     }
 
-    const authorMap = statusAggregator.get(participant);
-    authorMap.set(statusId, msg.key);
-
-    // Reset debounce timer to allow multi-slide bursts from all contacts to group together
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-        if (activeSock) {
-            triggerAggregatedBatch(activeSock);
-        }
-    }, 1500); // 1.5s window catches multi-slide burst uploads
+    const list = pendingStatusMap.get(participant);
+    if (!list.some(item => item.id === statusId)) {
+        list.push({ msg, id: statusId, key: msg.key });
+    }
 }
 
-async function triggerAggregatedBatch(sock) {
+async function processBatchStatusQueue(sock) {
     const activeConfig = getConfig();
     if (activeConfig.AUTO_STATUS_VIEW === 'off') {
-        statusAggregator.clear();
+        pendingStatusMap.clear();
         return;
     }
 
@@ -232,31 +247,29 @@ async function triggerAggregatedBatch(sock) {
     isProcessingBatch = true;
 
     try {
-        for (const [authorJid, itemsMap] of statusAggregator.entries()) {
-            if (itemsMap.size === 0) continue;
+        while (pendingStatusMap.size > 0) {
+            const currentCfg = getConfig();
+            if (currentCfg.AUTO_STATUS_VIEW === 'off') {
+                pendingStatusMap.clear();
+                break;
+            }
 
-            const allKeys = Array.from(itemsMap.values());
-            const allIds = Array.from(itemsMap.keys());
+            const [authorJid, items] = pendingStatusMap.entries().next().value;
+            pendingStatusMap.delete(authorJid);
+
+            if (!items || items.length === 0) continue;
+
+            const allKeys = items.map(item => item.key).filter(Boolean);
+            const allIds = items.map(item => item.id).filter(Boolean);
 
             try {
-                // 1. Mark ALL slides for this contact in one single atomic call
                 await sock.readMessages(allKeys);
-
-                // 2. Send multi-device read-self receipt for all slides simultaneously
-                if (sock.sendReceipt) {
-                    await sock.sendReceipt('status@broadcast', authorJid, allIds, 'read').catch(() => null);
-                    await new Promise(res => setTimeout(res, 150));
-                    await sock.sendReceipt('status@broadcast', authorJid, allIds, 'read-self').catch(() => null);
-                }
-
-                markStatusAsViewedOnDisk(allIds);
+                allIds.forEach(id => markStatusAsViewedOnDisk(id));
                 console.log(`[STORY-BATCH SYNCED 100%] Author: ${authorJid} | Total Slides Viewed: ${allIds.length}`);
             } catch (err) {}
 
-            // Pause between contacts to prevent socket rate limits
             await new Promise(res => setTimeout(res, 200));
         }
-        statusAggregator.clear();
     } finally {
         isProcessingBatch = false;
     }
@@ -269,9 +282,12 @@ async function sweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         if (!viewedStatusSet.has(id)) {
-            queueStatusForAggregator(msg, false);
+            queueStatusForBatch(msg, false);
             count++;
         }
+    }
+    if (count > 0) {
+        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -283,8 +299,11 @@ async function forceSweepAndReadStatuses(sock) {
     let count = 0;
     for (const [id, msg] of recentStatusStore.entries()) {
         viewedStatusSet.delete(id);
-        queueStatusForAggregator(msg, true);
+        queueStatusForBatch(msg, true);
         count++;
+    }
+    if (count > 0) {
+        processBatchStatusQueue(sock);
     }
     return count;
 }
@@ -396,7 +415,7 @@ async function startBot() {
 
             if (!initialActiveLogged) {
                 initialActiveLogged = true;
-                console.log(`✅ Silent Status Bot Active! Designed by Josva.`);
+                console.log(`✅ Silent Status Bot Active v2.0.0! Designed by Josva.`);
             }
 
             if (getConfig().AUTO_STATUS_VIEW !== 'off') {
@@ -411,20 +430,20 @@ async function startBot() {
                         const sudoJid = sock.user ? jidNormalizedUser(sock.user.id) : null;
                         if (sudoJid) {
                             const currentCfg = getConfig();
-                            const notifyText = `🚀 *SILENT STATUS BOT IS ONLINE*\n` +
+                            const notifyText = `🚀 *SILENT STATUS BOT IS ONLINE (v2.0.0)*\n` +
                                                `_Designed by Josva_\n\n` +
                                                `⚙️ *ACTIVE SETTINGS:*\n` +
                                                `• Status View: *${currentCfg.AUTO_STATUS_VIEW}*\n` +
                                                `• Anti-Delete: *${currentCfg.ANTI_DELETE}*\n\n` +
                                                `💬 *IN-CHAT COMMANDS:*\n` +
                                                `• *.alive* - Check bot uptime status\n` +
-                                               `• *.react <emoji>* | *.r* - Reply to any message to react with emoji\n` +
+                                               `• *.react <emoji>* | *.r* - Reply to message to react with emoji\n` +
                                                `• *.forceview* - Force re-view & resync all status updates\n` +
                                                `• *.sticker* | *.s* - Reply to photo/video to make sticker\n` +
                                                `• *.status no-dl* | *.status off* - Toggle Status Auto-View\n` +
                                                `• *.delete p* | *.delete g* | *.delete off* - Toggle Anti-Delete\n` +
                                                `• *.viewall* - Manually sweep & re-view status updates\n` +
-                                               `• *.vv* - Reply to View-Once media to unlock silently to SUDO DM\n` +
+                                               `• *.vv* - Reply to View-Once media to unlock to SUDO DM\n` +
                                                `• *.save* - Reply to any message/media to save to SUDO DM\n` +
                                                `• *.settings* - View live dashboard & RAM usage`;
 
@@ -455,17 +474,22 @@ async function startBot() {
     sock.ev.on('messages.upsert', async (m) => {
         const botUserJid = sock.user ? jidNormalizedUser(sock.user.id) : null;
         const botLid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null;
-
         const currentCfg = getConfig();
 
-        // 1. DEBOUNCED AGGREGATION FOR ALL STATUS UPDATES
+        // 1. ATOMIC STATUS BATCH GATHERING
+        const statusUpdates = [];
         for (const msg of m.messages) {
             if (msg.key && msg.key.remoteJid === 'status@broadcast' && !msg.key.fromMe) {
                 trackStatusKey(msg);
                 if (currentCfg.AUTO_STATUS_VIEW !== 'off') {
-                    queueStatusForAggregator(msg, false);
+                    statusUpdates.push(msg);
                 }
             }
+        }
+
+        if (statusUpdates.length > 0) {
+            statusUpdates.forEach(msg => queueStatusForBatch(msg, false));
+            processBatchStatusQueue(sock);
         }
 
         // 2. CHAT MESSAGES & COMMANDS
@@ -497,7 +521,7 @@ async function startBot() {
                 }
             }
 
-            // Anti-Delete Protocol Listener
+            // 3. ANTI-DELETE PROTOCOL LISTENER
             const activeAntiDelete = currentCfg.ANTI_DELETE;
             if (type === 'protocolMessage' && msg.message.protocolMessage?.type === 0 && activeAntiDelete !== 'off') {
                 const deletedKey = msg.message.protocolMessage.key;
@@ -578,9 +602,11 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .react / .r
-            if (['.react', '.r', '.reaction'].includes(command)) {
-                const reactionEmoji = args[1] || textContent.substring(command.length).trim() || '❤️';
+            // COMMAND: .react / .r (Accepts any user-inserted emoji: .react 😉 or .react🔥)
+            if (command.startsWith('.react') || command.startsWith('.r') || command.startsWith('.reaction')) {
+                let reactionEmoji = textContent.replace(/^\.(react|reaction|r)/i, '').trim();
+                if (!reactionEmoji) reactionEmoji = '❤️';
+
                 const quotedInfo = msg.message?.extendedTextMessage?.contextInfo;
 
                 if (quotedInfo && quotedInfo.stanzaId) {
@@ -606,12 +632,13 @@ async function startBot() {
                 continue;
             }
 
-            // COMMAND: .sticker / .s
+            // COMMAND: .sticker / .s (STRICTLY PICTURES & VIDEOS ONLY)
             if (['.sticker', '.s', '.stk'].includes(command)) {
                 const targetMedia = quotedMsg || msg.message;
                 const unwrappedMedia = unwrapMessage(targetMedia);
                 const mediaType = unwrappedMedia ? getContentType(unwrappedMedia) : null;
 
+                // Enforce media-only check (images or videos)
                 if (['imageMessage', 'videoMessage'].includes(mediaType)) {
                     try {
                         const targetMsgObj = quotedMsg ? {
@@ -635,7 +662,11 @@ async function startBot() {
                             cacheOutgoingMessage(sent);
                             console.log(`[.sticker COMMAND] Sticker created successfully`);
                         }
-                    } catch (err) {}
+                    } catch (err) {
+                        console.error('.sticker command error:', err);
+                    }
+                } else {
+                    await sendSafeReply(sock, fromJid, { text: '⚠️ Only pictures and videos can be converted to stickers.' }, msg);
                 }
                 continue;
             }
@@ -660,7 +691,7 @@ async function startBot() {
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [no-dl] ✅' }, msg);
                     } else if (['off', 'false'].includes(param)) {
                         updateConfig({ AUTO_STATUS_VIEW: 'off' });
-                        statusAggregator.clear();
+                        pendingStatusMap.clear();
                         await sendSafeReply(sock, fromJid, { text: 'Done! Status View: [off] 🛑 (Permanently Disabled)' }, msg);
                     } else {
                         const currentCfg = getConfig();
@@ -693,7 +724,7 @@ async function startBot() {
                     const minutes = Math.floor((uptimeSec % 3600) / 60);
                     const ramUsage = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
 
-                    const menuText = `⚙️ *BOT SETTINGS & STATUS*\n\n` +
+                    const menuText = `⚙️ *BOT SETTINGS & STATUS (v2.0.0)*\n\n` +
                                      `🛡️ *SUDO:* +${botUserJid ? botUserJid.split('@')[0] : 'Owner'}\n` +
                                      `👀 *AUTO STATUS VIEW:* ${currentCfg.AUTO_STATUS_VIEW !== 'off' ? '✅ (' + currentCfg.AUTO_STATUS_VIEW + ')' : '❎ (off)'}\n` +
                                      `🗑️ *ANTI DELETE MSG:* ${currentCfg.ANTI_DELETE !== 'off' ? '✅ (' + currentCfg.ANTI_DELETE + ')' : '❎ (off)'}\n` +
@@ -738,6 +769,7 @@ async function startBot() {
                                 payload.ptt = !!unwrappedVO.audioMessage?.ptt;
                             }
 
+                            // SENDS STRICTLY TO SUDO DM ONLY (Never back to chat or sender)
                             const res = await sock.sendMessage(botUserJid, payload);
                             if (res?.key?.id) {
                                 cacheOutgoingMessage(res);
@@ -782,6 +814,7 @@ async function startBot() {
                                 payload.mimetype = unwrappedSave.documentMessage?.mimetype || 'application/octet-stream';
                             }
 
+                            // SENDS STRICTLY TO SUDO DM ONLY
                             const res = await sock.sendMessage(botUserJid, payload);
                             if (res?.key?.id) {
                                 cacheOutgoingMessage(res);
